@@ -1,9 +1,10 @@
+
 """
-Step R1: Prepare Training Data for the Ranker Model.
+Step R1: Prepare Training Data for the Ranker Model (with Hard Negatives).
 
 This script creates positive and negative pairs for training the Cross-Encoder.
 Positive pair: (playlist_title, song_in_that_playlist)
-Negative pair: (playlist_title, random_song_not_in_that_playlist)
+Hard Negative pair: (playlist_title, song_in_same_cluster_but_not_in_playlist)
 """
 import os
 import sys
@@ -11,6 +12,8 @@ import pandas as pd
 import random
 import logging
 from tqdm import tqdm
+from collections import defaultdict
+import json
 
 # Add project root to sys.path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
@@ -28,14 +31,16 @@ class RankerDataBuilder:
         self.data_config = config.data
 
     def run(self, num_neg_samples: int = 1):
-        logger.info("--- Starting Step R1: Ranker Data Generation ---")
+        logger.info("--- Starting Step R1: Ranker Data Generation (with Hard Negatives) ---")
         playlist_info = self._load_playlist_info()
         playlist_songs = self._load_playlist_songs()
-        
-        # Get a list of all unique song IDs to sample negatives from
-        all_song_ids = list(pd.read_csv(self.data_config.song_vectors_file, dtype={'mixsongid': str})['mixsongid'].unique())
+        song_to_sem_id, sem_id_to_songs = self._load_semantic_maps()
+        all_song_ids = list(song_to_sem_id.keys())
 
-        training_data = self._create_training_pairs(playlist_info, playlist_songs, all_song_ids, num_neg_samples)
+        training_data = self._create_training_pairs(
+            playlist_info, playlist_songs, all_song_ids, 
+            song_to_sem_id, sem_id_to_songs, num_neg_samples
+        )
         
         self._save_data(training_data)
         logger.info("--- Step R1 Completed Successfully ---")
@@ -51,8 +56,25 @@ class RankerDataBuilder:
         df.columns = ['playlist_id', 'song_id']
         return df.groupby('playlist_id')['song_id'].apply(set).to_dict()
 
-    def _create_training_pairs(self, playlist_info: dict, playlist_songs: dict, all_song_ids: list, num_neg_samples: int) -> list:
-        logger.info("Creating positive and negative training pairs...")
+    def _load_semantic_maps(self) -> tuple[dict, dict]:
+        logger.info(f"Loading semantic ID maps from {self.data_config.semantic_ids_file}...")
+        song_to_sem_id = {}
+        sem_id_to_songs = defaultdict(list)
+        try:
+            with open(self.data_config.semantic_ids_file, 'r') as f:
+                for line in f: 
+                    item = json.loads(line)
+                    song_id, sem_id = item['song_id'], tuple(item['semantic_ids'])
+                    song_to_sem_id[song_id] = sem_id
+                    sem_id_to_songs[sem_id].append(song_id)
+        except FileNotFoundError: 
+            logger.error(f"FATAL: {self.data_config.semantic_ids_file} not found. Run G1 first.")
+            sys.exit(1)
+        return dict(song_to_sem_id), dict(sem_id_to_songs)
+
+    def _create_training_pairs(self, playlist_info, playlist_songs, all_song_ids, 
+                               song_to_sem_id, sem_id_to_songs, num_neg_samples) -> list:
+        logger.info("Creating positive and hard negative training pairs...")
         pairs = []
         for glid, songs_in_playlist in tqdm(playlist_songs.items(), desc="Creating pairs"):
             if glid not in playlist_info:
@@ -61,20 +83,32 @@ class RankerDataBuilder:
             if not title or not songs_in_playlist:
                 continue
 
-            # Add positive samples
-            for song_id in songs_in_playlist:
-                pairs.append((title, song_id, 1)) # (text, item, label)
+            for positive_song_id in songs_in_playlist:
+                # Add positive sample
+                pairs.append((title, positive_song_id, 1))
 
-            # Add negative samples
-            num_positives = len(songs_in_playlist)
-            num_negatives_to_generate = num_positives * num_neg_samples
-            
-            neg_samples_count = 0
-            # Simple random sampling for negatives
-            while neg_samples_count < num_negatives_to_generate:
-                random_song = random.choice(all_song_ids)
-                if random_song not in songs_in_playlist:
-                    pairs.append((title, random_song, 0))
+                # Generate hard negative samples
+                positive_sem_id = song_to_sem_id.get(positive_song_id)
+                if not positive_sem_id:
+                    continue
+
+                hard_candidates = sem_id_to_songs.get(positive_sem_id, [])
+                potential_negatives = set(hard_candidates) - songs_in_playlist
+
+                neg_samples_count = 0
+                while neg_samples_count < num_neg_samples:
+                    if potential_negatives:
+                        # Prioritize hard negatives from the same cluster
+                        hard_negative_song_id = random.choice(list(potential_negatives))
+                        pairs.append((title, hard_negative_song_id, 0))
+                        potential_negatives.remove(hard_negative_song_id) # Avoid re-sampling the same negative
+                    else:
+                        # Fallback to random negative if no hard negatives are available
+                        random_song_id = random.choice(all_song_ids)
+                        if random_song_id not in songs_in_playlist:
+                            pairs.append((title, random_song_id, 0))
+                        else:
+                            continue # Retry if we randomly picked a positive sample
                     neg_samples_count += 1
         return pairs
 
@@ -92,5 +126,4 @@ if __name__ == "__main__":
     setup_logging(log_file=log_file_path)
     logger = logging.getLogger(__name__)
     builder = RankerDataBuilder(config)
-    # For each positive sample, create 1 negative sample. This can be increased.
     builder.run(num_neg_samples=1)
