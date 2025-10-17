@@ -1,0 +1,22 @@
+# Core ML/DL Libraries
+torch
+torchvision
+transformers
+accelerate
+
+# Data Handling
+pandas
+numpy
+scikit-learn
+
+# Vector & Sequence Learning/Search
+gensim
+faiss-cpu # or faiss-gpu
+
+# Metrics & NLP Toolkit
+rouge_score
+nltk
+sentencepiece
+
+# Utilities
+tqdm
