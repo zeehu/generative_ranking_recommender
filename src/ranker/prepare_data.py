@@ -1,10 +1,10 @@
-
+"""
 Step R1: Prepare Training Data for the Ranker Model.
 
 This script creates positive and negative pairs for training the Cross-Encoder.
 Positive pair: (playlist_title, song_in_that_playlist)
 Negative pair: (playlist_title, random_song_not_in_that_playlist)
-
+"""
 import os
 import sys
 import pandas as pd
@@ -12,6 +12,7 @@ import random
 import logging
 from tqdm import tqdm
 
+# Add project root to sys.path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
@@ -30,7 +31,9 @@ class RankerDataBuilder:
         logger.info("--- Starting Step R1: Ranker Data Generation ---")
         playlist_info = self._load_playlist_info()
         playlist_songs = self._load_playlist_songs()
-        all_song_ids = pd.read_csv(self.data_config.song_vectors_file, dtype={'mixsongid': str})['mixsongid'].unique().tolist()
+        
+        # Get a list of all unique song IDs to sample negatives from
+        all_song_ids = list(pd.read_csv(self.data_config.song_vectors_file, dtype={'mixsongid': str})['mixsongid'].unique())
 
         training_data = self._create_training_pairs(playlist_info, playlist_songs, all_song_ids, num_neg_samples)
         
@@ -67,6 +70,7 @@ class RankerDataBuilder:
             num_negatives_to_generate = num_positives * num_neg_samples
             
             neg_samples_count = 0
+            # Simple random sampling for negatives
             while neg_samples_count < num_negatives_to_generate:
                 random_song = random.choice(all_song_ids)
                 if random_song not in songs_in_playlist:
@@ -88,4 +92,5 @@ if __name__ == "__main__":
     setup_logging(log_file=log_file_path)
     logger = logging.getLogger(__name__)
     builder = RankerDataBuilder(config)
-    builder.run(num_neg_samples=1) # For each positive, create 1 negative sample
+    # For each positive sample, create 1 negative sample. This can be increased.
+    builder.run(num_neg_samples=1)

@@ -1,9 +1,8 @@
-
 Step G2: Generate Training Corpus for the T5 Generator Model.
 
 This script reads the raw playlist data, combines it with the generated
 semantic IDs (song-to-cluster map), and produces train/val/test splits
-in a `playlist_id\tinput_text\toutput_sequence` format.
+in a `playlist_id	input_text	output_sequence` format.
 """
 import os
 import sys
@@ -16,7 +15,7 @@ import random
 # Add project root to sys.path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if project_root not in sys.path:
-    sys.path.insert(0, project_root)
+sys.path.insert(0, project_root)
 
 from config import Config
 from src.common.utils import setup_logging
@@ -83,6 +82,7 @@ class CorpusBuilder:
             if not title:
                 continue
 
+            # Per our "embrace collision" strategy, we do not de-duplicate songs or tokens here.
             sorted_songs = sorted(songs)
             semantic_tokens = []
             for song_id in sorted_songs:
@@ -112,6 +112,7 @@ class CorpusBuilder:
 
         logger.info(f"Data split: {len(train_data)} train, {len(val_data)} validation, {len(test_data)} test.")
         output_dir = os.path.join(self.config.output_dir, "generator")
+        os.makedirs(output_dir, exist_ok=True)
         self._save_to_tsv(train_data, os.path.join(output_dir, "train.tsv"))
         self._save_to_tsv(val_data, os.path.join(output_dir, "val.tsv"))
         self._save_to_tsv(test_data, os.path.join(output_dir, "test.tsv"))
