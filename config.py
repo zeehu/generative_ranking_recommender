@@ -21,7 +21,7 @@ class DataConfig:
 class Word2VecConfig:
     """Configuration for Word2Vec training."""
     vector_size: int = 256      # Dimensionality of the song vectors.
-    window: int = 10            # Context window size.
+    window: int = 100          # Increased context window size.
     min_count: int = 5          # Ignores all songs with total frequency lower than this.
     workers: int = -1           # Use all available CPU cores, -1 means all.
     epochs: int = 10            # Number of iterations over the corpus.

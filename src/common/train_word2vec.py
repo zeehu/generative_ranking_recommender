@@ -62,7 +62,7 @@ def train_song_vectors(config: Config):
         min_count=w2v_config.min_count,
         workers=workers,
         epochs=w2v_config.epochs,
-        sg=1  # Use Skip-gram
+        sg=0  # Use CBOW model as requested
     )
     logger.info("Word2Vec model training complete.")
 
