@@ -1,5 +1,6 @@
+
 """
-Step F1: Final Inference Demo.
+Step F1: Final Inference Demo for the Generate-and-Rank System.
 
 This script chains the Generator and Ranker models to produce a final,
 ranked list of recommendations from a user-provided text prompt.
@@ -9,6 +10,7 @@ import sys
 import logging
 import torch
 import random
+import pandas as pd
 from typing import Dict, List, Tuple
 from collections import defaultdict
 
@@ -32,48 +34,36 @@ class Demo:
         logger.info("Loading all models and mappings...")
         self.generator = self._load_generator()
         self.ranker = self._load_ranker()
-        self.song_to_sem_id_map, self.sem_id_to_songs_map = self._create_mappings()
+        self.song_to_sem_id_map, self.sem_id_to_songs_map = self._create_semantic_mappings()
+        self.song_to_vector_map = self._load_song_vectors()
         self.song_info_map = self._load_song_info()
         logger.info("All models and data loaded successfully.")
 
     def _load_generator(self) -> TIGERModel:
         path = os.path.join(self.config.model_dir, "generator", "final_model")
         logger.info(f"Loading Generator from {path}...")
-        if not os.path.exists(path):
-            logger.error("Generator model not found. Please run Step G3 first.")
-            sys.exit(1)
-        model = TIGERModel.from_pretrained(path)
-        model.model.to(self.device)
-        model.eval()
-        return model
+        return TIGERModel.from_pretrained(path).to(self.device).eval()
 
     def _load_ranker(self) -> CrossEncoder:
         path = os.path.join(self.config.model_dir, "ranker", "final_model")
         logger.info(f"Loading Ranker from {path}...")
-        if not os.path.exists(path):
-            logger.error("Ranker model not found. Please run Step R3 first.")
-            sys.exit(1)
-        # We need the generator's tokenizer to know the full vocabulary size
-        generator_tokenizer = self.generator.tokenizer
-        model = CrossEncoder.from_pretrained(path, tokenizer_len=len(generator_tokenizer))
-        model.to(self.device)
-        model.eval()
-        return model
+        # The ranker needs to know the full tokenizer length (with custom tokens)
+        tokenizer_len = len(self.generator.tokenizer)
+        return CrossEncoder.from_pretrained(path, tokenizer_len=tokenizer_len).to(self.device).eval()
 
     def predict(self, text: str, num_candidates: int = 100, top_k: int = 10) -> List[str]:
-        logger.info(f"Step 1: Generating {num_candidates} candidates with T5 Generator...")
-        # 1. Generate candidate semantic IDs
+        # === Step 1: Candidate Generation ===
+        logger.info(f"Generating {num_candidates} candidates with T5 Generator...")
         input_ids = self.generator.tokenizer.base_tokenizer(text, return_tensors="pt").input_ids.to(self.device)
         with torch.no_grad():
             generated_ids = self.generator.model.generate(
                 input_ids,
                 max_new_tokens=self.config.generator_t5.max_target_length,
-                num_beams=num_candidates, # Use beam search to get diverse candidates
+                num_beams=num_candidates,
                 num_return_sequences=num_candidates,
                 early_stopping=True
             )
         
-        # 2. Decode and expand to a candidate set of song IDs
         decoded_preds = self.generator.tokenizer.base_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
         candidate_song_ids = set()
         for pred_str in decoded_preds:
@@ -85,22 +75,28 @@ class Demo:
         logger.info(f"Generated {len(candidate_song_ids)} unique candidate songs.")
         if not candidate_song_ids: return []
 
-        logger.info(f"Step 2: Ranking {len(candidate_song_ids)} candidates with Cross-Encoder...")
-        # 3. Rank the candidates
+        # === Step 2: Precise Ranking ===
+        logger.info(f"Ranking {len(candidate_song_ids)} candidates with Cross-Encoder...")
         scores = []
-        ranker_tokenizer = self.generator.tokenizer.base_tokenizer # Ranker was trained with this tokenizer
+        ranker_tokenizer = self.generator.tokenizer.base_tokenizer
+        
         for song_id in candidate_song_ids:
-            sem_ids = self.song_to_sem_id_map.get(str(song_id), [])
-            sem_id_tokens = " ".join([f"<id_{sid}>" for sid in sem_ids])
-            combined_text = f"query: {text} document: {sem_id_tokens}"
-            encoding = ranker_tokenizer(combined_text, max_length=self.config.generator_t5.max_input_length, padding="max_length", truncation=True, return_tensors="pt")
-            
+            song_vector = self.song_to_vector_map.get(str(song_id))
+            if song_vector is None: continue
+
+            encoding = ranker_tokenizer(text, max_length=self.config.generator_t5.max_input_length, padding="max_length", truncation=True, return_tensors="pt")
+            song_vector_tensor = torch.tensor(song_vector, dtype=torch.float).unsqueeze(0) # Add batch dimension
+
             with torch.no_grad():
-                logits = self.ranker(input_ids=encoding.input_ids.to(self.device), attention_mask=encoding.attention_mask.to(self.device))['logits']
+                logits = self.ranker(
+                    input_ids=encoding.input_ids.to(self.device),
+                    attention_mask=encoding.attention_mask.to(self.device),
+                    song_vector=song_vector_tensor.to(self.device)
+                )['logits']
                 score = logits.squeeze().item()
             scores.append((song_id, score))
 
-        # 4. Sort and return top K
+        # === Step 3: Sort and Return Top K ===
         scores.sort(key=lambda x: x[1], reverse=True)
         return [song_id for song_id, score in scores[:top_k]]
 
@@ -134,11 +130,12 @@ class Demo:
                 break
         print("\n感谢使用，再见！")
 
-    # Helper methods (copied from evaluate_tiger.py)
+    # Helper methods
     def _get_semantic_tuples(self, semantic_str: str) -> List[Tuple[int, ...]]:
         numerical_ids = [int(token[4:-1]) for token in semantic_str.split() if token.startswith("<id_")]
         chunk_size = self.config.rqkmeans.levels
         return list(dict.fromkeys([tuple(numerical_ids[i:i+chunk_size]) for i in range(0, len(numerical_ids) - chunk_size + 1, chunk_size)]))
+    
     def _create_mappings(self) -> Tuple[Dict, Dict]:
         song_to_sem_id, sem_id_to_songs = {}, defaultdict(list)
         try:
@@ -150,7 +147,13 @@ class Demo:
                     sem_id_to_songs[sem_id].append(song_id)
         except FileNotFoundError: sys.exit(f"FATAL: {self.config.data.semantic_ids_file} not found.")
         return dict(song_to_sem_id), dict(sem_id_to_songs)
-    def _load_song_info(self): 
+
+    def _load_song_vectors(self) -> dict:
+        logger.info(f"Loading song vectors from {self.config.data.song_vectors_file}...")
+        df = pd.read_csv(self.config.data.song_vectors_file, dtype={'mixsongid': str}).set_index('mixsongid')
+        return {idx: row.to_numpy(dtype=np.float32) for idx, row in df.iterrows()}
+
+    def _load_song_info(self) -> dict: 
         import csv
         mapping = {}
         try:

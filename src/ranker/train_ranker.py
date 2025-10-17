@@ -1,5 +1,6 @@
+
 """
-Step R3: Train the Cross-Encoder Ranker Model.
+Step R3 (Refactored): Train the Hybrid Cross-Encoder Ranker Model.
 """
 import os
 import sys
@@ -8,7 +9,7 @@ import pandas as pd
 import torch
 import numpy as np
 from torch.utils.data import Dataset
-from transformers import Trainer, TrainingArguments, AutoTokenizer
+from transformers import Trainer, TrainingArguments, AutoTokenizer, default_data_collator
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 
@@ -24,11 +25,11 @@ from src.common.utils import set_seed, setup_logging
 logger = logging.getLogger(__name__)
 
 class RankingDataset(Dataset):
-    """Dataset for the ranker model training."""
-    def __init__(self, data: pd.DataFrame, tokenizer: AutoTokenizer, song_id_to_sem_id: dict, max_len: int):
+    """Dataset for the hybrid ranker model training."""
+    def __init__(self, data: pd.DataFrame, tokenizer: AutoTokenizer, song_id_to_vector: dict, max_len: int):
         self.data = data
         self.tokenizer = tokenizer
-        self.song_id_to_sem_id = song_id_to_sem_id
+        self.song_id_to_vector = song_id_to_vector
         self.max_len = max_len
 
     def __len__(self):
@@ -38,16 +39,16 @@ class RankingDataset(Dataset):
         row = self.data.iloc[idx]
         text, song_id, label = row['text'], str(row['song_id']), row['label']
         
-        sem_ids = self.song_id_to_sem_id.get(song_id, [])
-        sem_id_tokens = " ".join([f"<id_{sid}>" for sid in sem_ids])
+        # Get text encoding
+        encoding = self.tokenizer(text, max_length=self.max_len, padding="max_length", truncation=True, return_tensors="pt")
         
-        combined_text = f"query: {text} document: {sem_id_tokens}"
-        
-        encoding = self.tokenizer(combined_text, max_length=self.max_len, padding="max_length", truncation=True, return_tensors="pt")
-        
+        # Get song vector
+        song_vector = self.song_id_to_vector.get(song_id, np.zeros(self.song_id_to_vector['__dim__'], dtype=np.float32))
+
         return {
             "input_ids": encoding.input_ids.flatten(),
             "attention_mask": encoding.attention_mask.flatten(),
+            "song_vector": torch.tensor(song_vector, dtype=torch.float),
             "labels": torch.tensor(label, dtype=torch.float)
         }
 
@@ -57,53 +58,43 @@ class RankerTrainer:
         set_seed(config.seed)
 
     def run(self):
-        logger.info("--- Starting Step R3: Cross-Encoder Ranker Training ---")
+        logger.info("--- Starting Step R3: Hybrid Cross-Encoder Ranker Training ---")
         model_config = self.config.generator_t5 # Reuse T5 config for base model path
-        
-        # Load the tokenizer from the GENERATOR model, as it has the custom <id_..> tokens
-        generator_model_path = os.path.join(self.config.model_dir, "generator", "final_model")
-        if not os.path.exists(generator_model_path):
-            logger.error(f"Generator model not found at {generator_model_path}. Please run G3 first.")
-            sys.exit(1)
-        tokenizer = AutoTokenizer.from_pretrained(generator_model_path)
+        w2v_config = self.config.word2vec
 
-        # Load the song->semantic_id map
-        with open(self.config.data.semantic_ids_file, 'r') as f:
-            song_id_to_sem_id = {item['song_id']: item['semantic_ids'] for item in (json.loads(line) for line in f)}
+        # Load tokenizer (can be any T5 tokenizer, as we don't use custom tokens here)
+        tokenizer = AutoTokenizer.from_pretrained(model_config.model_name)
+
+        # Load song vectors
+        logger.info(f"Loading song vectors from {self.config.data.song_vectors_file}...")
+        vectors_df = pd.read_csv(self.config.data.song_vectors_file, dtype={'mixsongid': str}).set_index('mixsongid')
+        song_id_to_vector = {idx: row.to_numpy() for idx, row in vectors_df.iterrows()}
+        song_id_to_vector['__dim__'] = w2v_config.vector_size # Store dimension for zero vector
 
         # Load training data
         data_path = os.path.join(self.config.output_dir, "ranker", "ranking_train_data.tsv")
-        if not os.path.exists(data_path):
-            logger.error(f"Ranker training data not found at {data_path}. Please run R1 first.")
-            sys.exit(1)
         df = pd.read_csv(data_path, sep='\t')
 
-        # Split data
         train_df, eval_df = train_test_split(df, test_size=0.1, random_state=self.config.seed)
 
-        # Create datasets
-        train_dataset = RankingDataset(train_df, tokenizer, song_id_to_sem_id, model_config.max_input_length)
-        eval_dataset = RankingDataset(eval_df, tokenizer, song_id_to_sem_id, model_config.max_input_length)
+        train_dataset = RankingDataset(train_df, tokenizer, song_id_to_vector, model_config.max_input_length)
+        eval_dataset = RankingDataset(eval_df, tokenizer, song_id_to_vector, model_config.max_input_length)
 
-        # Initialize model
-        model = CrossEncoder(base_model=model_config.model_name, tokenizer_len=len(tokenizer))
+        model = CrossEncoder(base_model=model_config.model_name, song_vector_dim=w2v_config.vector_size)
 
         def compute_metrics(p):
-            preds = p.predictions[0] if isinstance(p.predictions, tuple) else p.predictions
-            preds = (torch.sigmoid(torch.tensor(preds)) > 0.5).float().numpy()
+            logits = p.predictions[0] if isinstance(p.predictions, tuple) else p.predictions
+            preds = (torch.sigmoid(torch.tensor(logits)) > 0.5).float().numpy()
             precision, recall, f1, _ = precision_recall_fscore_support(p.label_ids, preds, average='binary')
             acc = accuracy_score(p.label_ids, preds)
             return {'accuracy': acc, 'f1': f1, 'precision': precision, 'recall': recall}
 
         training_args = TrainingArguments(
             output_dir=os.path.join(self.config.model_dir, "ranker", "checkpoints"),
-            num_train_epochs=3, # Ranker fine-tuning usually needs fewer epochs
-            per_device_train_batch_size=model_config.per_device_train_batch_size,
-            gradient_accumulation_steps=model_config.gradient_accumulation_steps,
-            learning_rate=1e-5, # Use a smaller LR for fine-tuning rankers
+            num_train_epochs=3,
+            per_device_train_batch_size=64, # Can use a larger batch size for ranker
+            learning_rate=1e-5,
             fp16=model_config.fp16,
-            gradient_checkpointing=True,
-            gradient_checkpointing_kwargs=model_config.gradient_checkpointing_kwargs,
             eval_strategy="steps",
             eval_steps=500,
             save_strategy="steps",
@@ -123,6 +114,7 @@ class RankerTrainer:
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
             compute_metrics=compute_metrics,
+            data_collator=default_data_collator # Default collator works for this structure
         )
 
         logger.info("Starting ranker training...")
