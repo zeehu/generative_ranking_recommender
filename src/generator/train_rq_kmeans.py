@@ -1,4 +1,3 @@
-
 Step G1: Generate Song Semantic IDs using RQ-KMeans.
 
 This script reads the song vectors created in Step G0 and uses Faiss for
