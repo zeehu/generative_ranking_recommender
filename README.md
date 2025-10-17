@@ -45,6 +45,12 @@ generative_ranking_recommender/
 
 我们将严格按照此路线图，一步一步完成整个工程。
 
+### **第零部分：基础向量学习**
+
+1.  **G0 - 学习歌曲向量**: 在 `src/common/` 中创建 `train_word2vec.py`，从歌单的歌曲序列中，使用 `word2vec` 为每首歌曲学习一个基础向量。
+    *   **命令**: `python src/common/train_word2vec.py`
+    *   **输出**: `outputs/song_vectors.csv`
+
 ### **第一部分：【引擎一】T5生成模型 (用于候选生成)**
 
 1.  **G1 - 向量量化**: 在 `src/generator/` 中创建 `train_rq_kmeans.py`，将歌曲向量量化为“概念簇ID”。
