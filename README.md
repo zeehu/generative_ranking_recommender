@@ -57,12 +57,13 @@ generative_ranking_recommender/
 2.  **G2 - 语料生成**: 在 `src/generator/` 中创建 `prepare_corpus.py`，生成 `(文本 -> 概念簇ID序列)` 格式的训练数据。
 3.  **G3 - 模型训练**: 在 `src/generator/` 中创建 `train_t5.py`，训练T5模型学会根据文本生成概念序列。
 
-### **第二部分：【引擎二】Cross-Encoder相关性模型 (用于精准排序)**
+### **第三部分：【引擎二】Cross-Encoder相关性模型 (用于精准排序)**
 
 1.  **R1 - 数据生成**: 在 `src/ranker/` 中创建 `prepare_data.py`，生成 `(文本, 歌曲ID) -> 相关/不相关` 格式的标签数据。
-2.  **R2 - 模型训练**: 在 `src/ranker/` 中创建 `train_ranker.py`，在一个二分类任务上训练Cross-Encoder模型。
+2.  **R2 - 模型定义**: 在 `src/ranker/` 中创建 `ranker_model.py`，定义将拼接“文本”和“歌曲语义ID”作为输入的Cross-Encoder模型。
+3.  **R3 - 模型训练**: 在 `src/ranker/` 中创建 `train_ranker.py`，在一个二分类任务上训练Cross-Encoder模型。
 
-### **第三部分：最终流水线与演示**
+### **第四部分：最终流水线与演示**
 
 1.  **F1 - 推理演示**: 在 `src/` 目录下创建 `demo.py`，该脚本将串联两个引擎：
     *   调用**生成模型**，为输入文本产出候选集。

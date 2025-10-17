@@ -1,0 +1,109 @@
+
+Step G3: Train the T5 Generator Model.
+
+import os
+import sys
+import logging
+from torch.utils.data import Dataset
+from transformers import Trainer, TrainingArguments, DataCollatorForSeq2Seq
+
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+from config import Config
+from src.generator.tiger_model import TIGERModel, TIGERTokenizer
+from src.common.utils import set_seed, setup_logging
+
+logger = logging.getLogger(__name__)
+
+class PlaylistDataset(Dataset):
+    def __init__(self, data_path: str, tokenizer: TIGERTokenizer, max_input_len: int, max_target_len: int):
+        self.data = []
+        with open(data_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                parts = line.strip().split('\t')
+                if len(parts) == 3:
+                    _, input_text, target_text = parts
+                    self.data.append((input_text, target_text))
+        self.tokenizer = tokenizer
+        self.max_input_len = max_input_len
+        self.max_target_len = max_target_len
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        input_text, target_text = self.data[idx]
+        input_encoding = self.tokenizer.base_tokenizer(input_text, max_length=self.max_input_len, truncation=True)
+        target_encoding = self.tokenizer.base_tokenizer(target_text, max_length=self.max_target_len, truncation=True)
+        return {"input_ids": input_encoding.input_ids, "attention_mask": input_encoding.attention_mask, "labels": target_encoding.input_ids}
+
+class T5Trainer:
+    def __init__(self, config: Config):
+        self.config = config
+        set_seed(config.seed)
+
+    def run(self):
+        logger.info("--- Starting Step G3: T5 Generator Model Training ---")
+        model_config = self.config.generator_t5
+        
+        model = TIGERModel(base_model=model_config.model_name, vocab_size=self.config.rqkmeans.vocab_size)
+        model.model.config.use_cache = False
+        tokenizer = model.tokenizer
+
+        train_dataset = PlaylistDataset(os.path.join(self.config.output_dir, "generator", "train.tsv"), tokenizer, model_config.max_input_length, model_config.max_target_length)
+        val_dataset = PlaylistDataset(os.path.join(self.config.output_dir, "generator", "val.tsv"), tokenizer, model_config.max_input_length, model_config.max_target_length)
+
+        training_args = TrainingArguments(
+            output_dir=os.path.join(self.config.model_dir, "generator", "checkpoints"),
+            num_train_epochs=model_config.num_train_epochs,
+            per_device_train_batch_size=model_config.per_device_train_batch_size,
+            gradient_accumulation_steps=model_config.gradient_accumulation_steps,
+            learning_rate=model_config.learning_rate,
+            warmup_steps=model_config.warmup_steps,
+            weight_decay=model_config.weight_decay,
+            fp16=model_config.fp16,
+            gradient_checkpointing=True,
+            gradient_checkpointing_kwargs=model_config.gradient_checkpointing_kwargs,
+            max_grad_norm=1.0,
+            eval_strategy="steps",
+            eval_steps=1000,
+            save_strategy="steps",
+            save_steps=1000,
+            save_total_limit=2,
+            load_best_model_at_end=True,
+            metric_for_best_model="eval_loss",
+            greater_is_better=False,
+            logging_steps=100,
+            report_to="none",
+            dataloader_num_workers=self.config.num_workers,
+            remove_unused_columns=False,
+        )
+
+        trainer = Trainer(
+            model=model.model,
+            args=training_args,
+            train_dataset=train_dataset,
+            eval_dataset=val_dataset,
+            data_collator=DataCollatorForSeq2Seq(tokenizer=tokenizer.base_tokenizer, model=model.model)
+        )
+        
+        logger.info("Enabling torch.compile for model optimization...")
+        model.model = torch.compile(model.model)
+
+        logger.info("Starting training...")
+        trainer.train()
+
+        final_model_path = os.path.join(self.config.model_dir, "generator", "final_model")
+        model.save_pretrained(final_model_path)
+        logger.info(f"Training complete. Final generator model saved to {final_model_path}")
+        logger.info("--- Step G3 Completed Successfully ---")
+
+if __name__ == "__main__":
+    config = Config()
+    log_file_path = os.path.join(config.log_dir, "g3_train_t5.log")
+    setup_logging(log_file=log_file_path)
+    logger = logging.getLogger(__name__)
+    trainer = T5Trainer(config)
+    trainer.run()
