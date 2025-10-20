@@ -60,6 +60,7 @@ def train_song_vectors(config: Config):
         vector_size=w2v_config.vector_size,
         window=w2v_config.window,
         min_count=w2v_config.min_count,
+        sample=w2v_config.sample, # Add subsampling
         workers=workers,
         epochs=w2v_config.epochs,
         sg=0  # Use CBOW model as requested
