@@ -30,8 +30,8 @@ logger = logging.getLogger(__name__)
 def load_song_info(song_info_path: str) -> pd.DataFrame:
     logger.info(f"Loading song info from {song_info_path}...")
     try:
-        df = pd.read_csv(song_info_path, sep='	', header=None, names=['mixsongid', 'song_name', 'singer_name'])
-        df.set_index('mixsongid', inplace=True)
+        df = pd.read_csv(song_info_path, sep='\t', header=None, names=['song_id', 'song_name', 'singer_name'])
+        df.set_index('song_id', inplace=True)
         return df
     except FileNotFoundError:
         logger.error(f"Song info file not found at {song_info_path}. Cannot display song names.")
@@ -79,8 +79,8 @@ def main(config: Config):
     # 1. Load Vectors
     logger.info(f"Loading song vectors from {data_config.song_vectors_file}...")
     try:
-        vectors_df = pd.read_csv(data_config.song_vectors_file, dtype={'mixsongid': str})
-        vectors_df.set_index('mixsongid', inplace=True)
+        vectors_df = pd.read_csv(data_config.song_vectors_file, dtype={'song_id': str})
+        vectors_df.set_index('song_id', inplace=True)
     except FileNotFoundError:
         logger.error(f"FATAL: {data_config.song_vectors_file} not found. Run train_word2vec.py first.")
         return

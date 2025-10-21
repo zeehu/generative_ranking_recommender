@@ -45,15 +45,23 @@ generative_ranking_recommender/
 
 我们将严格按照此路线图，一步一步完成整个工程。
 
-### **第零部分：基础向量学习**
+### **第零部分：基础向量学习 (G0)**
 
-1.  **G0 - 学习歌曲向量**: 在 `src/common/` 中创建 `train_word2vec.py`，从歌单的歌曲序列中，使用 `word2vec` 为每首歌曲学习一个基础向量。
+这一部分分为两个步骤，旨在从原始数据高效地生成高质量的歌曲向量。
+
+1.  **G0a - 预处理歌单数据**:
+    *   **命令**: `python src/common/preprocess_playlists.py`
+    *   **作用**: 读取原始的歌单-歌曲文件，筛选长度在10到300之间的歌单，并生成一个内存优化的、用于`word2vec`训练的语料文件。
+    *   **输出**: `outputs/playlists_corpus.txt`
+
+2.  **G0b - 训练歌曲向量**:
     *   **命令**: `python src/common/train_word2vec.py`
+    *   **作用**: 高效地读取上一步生成的语料文件，使用`FastText(CBOW)`模型为每首歌曲学习一个基础向量。
     *   **输出**: `outputs/song_vectors.csv`
 
-2.  **G0b - (可选) 评估向量质量**: 在 `src/common/` 中创建 `evaluate_vectors.py`，用于定性评估向量效果。
+3.  **G0c - (可选) 评估向量质量**:
     *   **命令**: `python src/common/evaluate_vectors.py`
-    *   **作用**: 启动一个交互式界面，输入歌曲ID，查找并展示最相似的歌曲，从而判断向量学习的质量。
+    *   **作用**: 启动一个交互式界面，输入歌曲ID，查找最相似的歌曲，从而定性地判断向量学习的效果。
 
 ### **第一部分：【引擎一】T5生成模型 (用于候选生成)**
 
