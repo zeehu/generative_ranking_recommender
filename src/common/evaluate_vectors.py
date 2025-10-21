@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 def load_song_info(song_info_path: str) -> pd.DataFrame:
     logger.info(f"Loading song info from {song_info_path}...")
     try:
-        df = pd.read_csv(song_info_path, dtype={'mixsongid': str})
+        df = pd.read_csv(song_info_path, sep='	', header=None, names=['mixsongid', 'song_name', 'singer_name'])
         df.set_index('mixsongid', inplace=True)
         return df
     except FileNotFoundError:

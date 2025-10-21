@@ -54,7 +54,7 @@ class CorpusBuilder:
     def _load_playlist_info(self) -> dict:
         logger.info(f"Loading playlist info from {self.data_config.playlist_info_file}...")
         try:
-            df = pd.read_csv(self.data_config.playlist_info_file, dtype=str)
+            df = pd.read_csv(self.data_config.playlist_info_file, sep='\t', header=None, names=['glid', 'listname', 'tag_list'])
             df.set_index('glid', inplace=True)
             return df.to_dict('index')
         except FileNotFoundError:

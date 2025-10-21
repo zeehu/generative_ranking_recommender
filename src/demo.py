@@ -158,8 +158,7 @@ class Demo:
         mapping = {}
         try:
             with open(self.config.data.song_info_file, 'r', encoding='utf-8') as f:
-                reader = csv.reader(f)
-                next(reader, None)
+                reader = csv.reader(f, delimiter='\t')
                 for row in reader:
                     if len(row) >= 3: mapping[row[0]] = {"name": row[1], "singer": row[2]}
         except FileNotFoundError: logger.warning("Song info file not found.")

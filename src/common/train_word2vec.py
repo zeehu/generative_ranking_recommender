@@ -1,16 +1,19 @@
+
 """
 Step G0: Train Song Vectors using Word2Vec/FastText.
 
-This script reads playlist-song data, groups songs into playlists in a memory-safe
-way, trains a gensim model, and saves the resulting vectors to CSV.
+This script uses a memory-efficient streaming approach to process a large,
+sorted playlist file, trains a gensim model, and saves the vectors.
 """
 import os
 import sys
 import pandas as pd
 import logging
 import time
+import csv
 from gensim.models import FastText
 from gensim.models.callbacks import CallbackAny2Vec
+from itertools import groupby
 from tqdm import tqdm
 
 # Add project root to sys.path
@@ -39,21 +42,29 @@ class TqdmCallback(CallbackAny2Vec):
         epoch_loss = current_loss - self.loss_before
         print(f"Epoch finished. Loss: {epoch_loss}")
 
+class PlaylistCorpus:
+    """An iterator that yields playlists (sentences) from a large, sorted CSV file."""
+    def __init__(self, filepath):
+        self.filepath = filepath
+
+    def __iter__(self):
+        with open(self.filepath, 'r', encoding='utf-8') as f:
+            reader = csv.reader(f, delimiter='\t')
+            # Group by the first column (playlist_id)
+            for _, group in groupby(reader, key=lambda x: x[0]):
+                yield [row[1] for row in group]
+
 def train_song_vectors(config: Config):
     logger.info("--- Starting Step G0: Train Song Vectors ---")
     data_config = config.data
     w2v_config = config.word2vec
 
-    # 1. Load data and group into sentences (playlists)
+    # 1. Prepare a corpus iterator
     try:
-        logger.info(f"Loading playlist songs from {data_config.playlist_songs_file}...")
-        df = pd.read_csv(data_config.playlist_songs_file, dtype=str)
-        df.columns = ['playlist_id', 'song_id']
-        logger.info("Grouping songs into playlists (sentences)...")
-        sentences = df.groupby('playlist_id')['song_id'].apply(list).tolist()
-        logger.info(f"Created {len(sentences)} sentences for training.")
-    except FileNotFoundError:
-        logger.error(f"FATAL: Playlist songs file not found at {data_config.playlist_songs_file}")
+        logger.info(f"Initializing corpus iterator for {data_config.playlist_songs_file}...")
+        sentences = PlaylistCorpus(data_config.playlist_songs_file)
+    except Exception as e:
+        logger.error(f"FATAL: Failed to read {data_config.playlist_songs_file}. Error: {e}")
         sys.exit(1)
 
     # 2. Train Word2Vec model
@@ -61,13 +72,13 @@ def train_song_vectors(config: Config):
     logger.info(f"Initializing FastText model with {workers} workers...")
     
     model = FastText(
-        sentences=sentences,
+        corpus_iterable=sentences,
         vector_size=w2v_config.vector_size,
         window=w2v_config.window,
         min_count=w2v_config.min_count,
         workers=workers,
-        sg=0,  # Use CBOW as requested
-        sample=1e-4, # Subsample frequent words
+        sg=0,  # Use CBOW
+        sample=1e-4,
         epochs=w2v_config.epochs,
         callbacks=[TqdmCallback(w2v_config.epochs)],
         compute_loss=True
@@ -77,12 +88,14 @@ def train_song_vectors(config: Config):
     # 3. Save the vectors to a CSV file
     output_file = data_config.song_vectors_file
     logger.info(f"Saving {len(model.wv.index_to_key)} song vectors to {output_file}...")
-    vectors_df = pd.DataFrame(model.wv.vectors, index=model.wv.index_to_key)
-    vectors_df.columns = [f'v_{i}' for i in range(w2v_config.vector_size)]
-    vectors_df.index.name = 'mixsongid'
-    vectors_df.to_csv(output_file)
+    with open(output_file, 'w', encoding='utf-8') as f:
+        writer = csv.writer(f, delimiter='\t')
+        # No header
+        for song_id in model.wv.index_to_key:
+            vector = model.wv[song_id]
+            writer.writerow([song_id] + vector.tolist())
 
-    # 4. Save the full model for later use
+    # 4. Save the full model
     model_output_path = os.path.join(config.model_dir, "word2vec.model")
     model.save(model_output_path)
     logger.info(f"Full model saved to {model_output_path}")
@@ -95,7 +108,7 @@ if __name__ == "__main__":
     setup_logging(log_file=log_file_path)
     logger = logging.getLogger(__name__)
 
-    if config.data.playlist_songs_file == "path/to/your/gen_playlist_song.csv":
+    if "path/to/your" in config.data.playlist_songs_file:
         logger.error("FATAL: Please edit 'config.py' and set the path for 'playlist_songs_file'.")
         sys.exit(1)
 

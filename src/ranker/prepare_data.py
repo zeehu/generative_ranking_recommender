@@ -35,7 +35,7 @@ class RankerDataBuilder:
         playlist_info = self._load_playlist_info()
         playlist_songs = self._load_playlist_songs()
         song_to_sem_id, sem_id_to_songs = self._load_semantic_maps()
-        all_song_ids = list(song_to_sem_id.keys())
+        all_song_ids = list(pd.read_csv(self.data_config.song_vectors_file, sep='	', header=None, names=['song_id'] + [f'v_{i}' for i in range(self.config.word2vec.vector_size)])['song_id'].unique())
 
         training_data = self._create_training_pairs(
             playlist_info, playlist_songs, all_song_ids, 
