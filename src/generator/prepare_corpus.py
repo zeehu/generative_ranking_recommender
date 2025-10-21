@@ -1,3 +1,4 @@
+"""
 Step G2: Generate Training Corpus for the T5 Generator Model.
 
 This script reads the raw playlist data, combines it with the generated
