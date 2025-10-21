@@ -1,10 +1,11 @@
+"""
 Step G-1 (New): Preprocess raw playlist data.
 
 This script filters playlists based on length (10 <= length <= 300)
 and converts the data into a clean corpus file where each line represents
 a full playlist (space-separated song IDs). It also saves the corresponding
 playlist IDs to a separate file.
-
+"""
 import os
 import sys
 import pandas as pd
@@ -28,7 +29,7 @@ def preprocess_playlist_data(config: Config):
 
     input_file = data_config.playlist_songs_file
     output_corpus_file = w2v_config.corpus_file
-    output_ids_file = w22v_config.corpus_ids_file
+    output_ids_file = w2v_config.corpus_ids_file
 
     try:
         logger.info(f"Loading raw playlist data from {input_file}...")
