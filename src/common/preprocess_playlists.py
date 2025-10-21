@@ -1,4 +1,3 @@
-
 """
 Step G-1 (New): Preprocess raw playlist data.
 
@@ -17,7 +16,7 @@ from tqdm import tqdm
 # Add project root to sys.path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if project_root not in sys.path:
-    sys.path.insert(0, project_root)
+    sys.sys.path.insert(0, project_root)
 
 from config import Config
 from src.common.utils import setup_logging
@@ -42,9 +41,10 @@ def preprocess_playlist_data(config: Config):
         total_playlists = 0
         with open(input_file, 'r', encoding='utf-8') as f:
             reader = csv.reader(f, delimiter='\t')
-            for _ in groupby(reader, key=lambda x: x[0]):
+            # Safely get the key for groupby, handling potential empty lines
+            for _ in groupby(reader, key=lambda x: x[0] if x else None):
                 total_playlists += 1
-        logger.info(f"Found {total_playlists} total playlists in source file.")
+        logger.info(f"Found {total_playlists} total groups in source file.")
 
         # Ensure output directory exists
         os.makedirs(os.path.dirname(output_corpus_file), exist_ok=True)
@@ -56,12 +56,19 @@ def preprocess_playlist_data(config: Config):
              open(output_ids_file, 'w', encoding='utf-8') as f_ids:
             
             reader = csv.reader(fin, delimiter='\t')
-            groups = groupby(reader, key=lambda x: x[0])
+            # Safely get the key for groupby
+            groups = groupby(reader, key=lambda x: x[0] if x else None)
             
             processed_count = 0
             for playlist_id, song_group in tqdm(groups, total=total_playlists, desc="Processing playlists"):
-                song_list = [song[1] for song in song_group]
+                # Skip potential empty lines that get grouped under None key
+                if playlist_id is None:
+                    continue
                 
+                # Safely build the song list, checking for rows with at least 2 columns
+                song_list = [song[1] for song in song_group if len(song) > 1]
+                
+                # Apply length filter
                 if min_len <= len(song_list) <= max_len:
                     f_corpus.write(' '.join(song_list) + '\n')
                     f_ids.write(str(playlist_id) + '\n')
