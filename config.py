@@ -21,6 +21,7 @@ class DataConfig:
 class Word2VecConfig:
     """Configuration for Word2Vec training."""
     corpus_file: str = "outputs/playlists_corpus.txt" # Path to the preprocessed corpus
+    corpus_ids_file: str = "outputs/playlists_corpus.ids.txt" # Path to the corresponding playlist IDs
     vector_size: int = 256      # Dimensionality of the song vectors.
     window: int = 100          # Increased context window size.
     min_count: int = 5          # Ignores all songs with total frequency lower than this.
