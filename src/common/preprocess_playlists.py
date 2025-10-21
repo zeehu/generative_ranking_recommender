@@ -1,15 +1,14 @@
 """
 Step G-1 (New): Preprocess raw playlist data.
 
-This script filters playlists based on length (10 <= length <= 300)
-and converts the data into a clean corpus file where each line represents
-a full playlist (space-separated song IDs). It also saves the corresponding
-playlist IDs to a separate file.
+This script streams a large, sorted playlist file, filters playlists by length,
+and writes the output to a corpus file and a corresponding ID file.
 """
 import os
 import sys
-import pandas as pd
 import logging
+import csv
+from itertools import groupby
 from tqdm import tqdm
 
 # Add project root to sys.path
@@ -23,7 +22,7 @@ from src.common.utils import setup_logging
 logger = logging.getLogger(__name__)
 
 def preprocess_playlist_data(config: Config):
-    logger.info("--- Starting Step G-1: Preprocessing Playlist Data ---")
+    logger.info("--- Starting Step G-1: Preprocessing Playlist Data (Streaming) ---")
     data_config = config.data
     w2v_config = config.word2vec
 
@@ -31,32 +30,41 @@ def preprocess_playlist_data(config: Config):
     output_corpus_file = w2v_config.corpus_file
     output_ids_file = w2v_config.corpus_ids_file
 
-    try:
-        logger.info(f"Loading raw playlist data from {input_file}...")
-        df = pd.read_csv(input_file, sep='\t', header=None, names=['playlist_id', 'song_id'], dtype=str)
-    except FileNotFoundError:
-        logger.error(f"FATAL: Raw playlist file not found at {input_file}")
-        sys.exit(1)
-
-    logger.info("Grouping songs by playlist...")
-    playlists = df.groupby('playlist_id')['song_id'].apply(list)
-    logger.info(f"Found {len(playlists)} unique playlists.")
-
     min_len, max_len = 10, 300
-    logger.info(f"Filtering playlists to have between {min_len} and {max_len} songs...")
-    filtered_playlists = playlists[playlists.str.len().between(min_len, max_len)]
-    logger.info(f"{len(filtered_playlists)} playlists remain after filtering.")
+    logger.info(f"Streaming from {input_file} and filtering playlists with length between {min_len} and {max_len}...")
 
-    logger.info(f"Saving formatted corpus to {output_corpus_file} and IDs to {output_ids_file}...")
     # Ensure output directory exists
     os.makedirs(os.path.dirname(output_corpus_file), exist_ok=True)
-    
-    with open(output_corpus_file, 'w', encoding='utf-8') as f_corpus, \
-         open(output_ids_file, 'w', encoding='utf-8') as f_ids:
+
+    try:
+        with open(input_file, 'r', encoding='utf-8') as fin, \
+             open(output_corpus_file, 'w', encoding='utf-8') as f_corpus, \
+             open(output_ids_file, 'w', encoding='utf-8') as f_ids:
+            
+            reader = csv.reader(fin, delimiter='\t')
+            # Group by the first column (playlist_id) since the file is sorted
+            groups = groupby(reader, key=lambda x: x[0])
+            
+            processed_count = 0
+            for playlist_id, song_group in tqdm(groups, desc="Processing playlists"):
+                # song_group is an iterator, convert to list
+                song_list = [song[1] for song in song_group]
+                
+                # Apply length filter
+                if min_len <= len(song_list) <= max_len:
+                    f_corpus.write(' '.join(song_list) + '\n')
+                    f_ids.write(str(playlist_id) + '\n')
+                    processed_count += 1
         
-        for playlist_id, song_list in tqdm(filtered_playlists.items(), desc="Writing corpus and IDs"):
-            f_corpus.write(' '.join(song_list) + '\n')
-            f_ids.write(str(playlist_id) + '\n')
+        logger.info(f"Processing complete. Wrote {processed_count} playlists to output files.")
+
+    except FileNotFoundError:
+        logger.error(f"FATAL: Sorted playlist file not found at {input_file}")
+        logger.error("Please ensure the file is sorted and the path in config.py is correct.")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"An unexpected error occurred: {e}")
+        sys.exit(1)
 
     logger.info(f"--- Step G-1 Completed Successfully. ---")
 
