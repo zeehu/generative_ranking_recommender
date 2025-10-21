@@ -51,6 +51,10 @@ generative_ranking_recommender/
     *   **命令**: `python src/common/train_word2vec.py`
     *   **输出**: `outputs/song_vectors.csv`
 
+2.  **G0b - (可选) 评估向量质量**: 在 `src/common/` 中创建 `evaluate_vectors.py`，用于定性评估向量效果。
+    *   **命令**: `python src/common/evaluate_vectors.py`
+    *   **作用**: 启动一个交互式界面，输入歌曲ID，查找并展示最相似的歌曲，从而判断向量学习的质量。
+
 ### **第一部分：【引擎一】T5生成模型 (用于候选生成)**
 
 1.  **G1 - 向量量化**: 在 `src/generator/` 中创建 `train_rq_kmeans.py`，将歌曲向量量化为“概念簇ID”。

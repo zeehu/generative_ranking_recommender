@@ -1,103 +1,123 @@
-"""
-Step G0: Train Song Vectors using Word2Vec.
 
-This script reads playlist-song data and uses a Word2Vec model to learn
-a vector representation for each unique song based on its co-occurrence
-in playlists.
+
+"""
+Step G0: Train Song Vectors using Word2Vec/FastText.
+
+This script adapts the user's reference implementation.
+It reads playlist-song data, prepares a temporary corpus file for memory
+efficiency, trains a gensim model, and saves the resulting vectors to CSV.
 """
 import os
 import sys
 import pandas as pd
 import logging
-from gensim.models import Word2Vec
+import time
+from gensim.models import FastText # Using FastText as per user's reference code
+from gensim.models.callbacks import CallbackAny2Vec
+from itertools import groupby
+from tqdm import tqdm
 
-# Adjust path to import from the project root
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, '..', '..'))
+# Add project root to sys.path
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if project_root not in sys.path:
-    sys.path.append(project_root)
+    sys.path.insert(0, project_root)
 
-from src.common.utils import setup_logging
 from config import Config
+from src.common.utils import setup_logging
 
 logger = logging.getLogger(__name__)
 
-def train_song_vectors(config: Config):
-    """Main function to train and save song vectors."""
-    logger.info("--- Starting Step G0: Train Song Vectors with Word2Vec ---")
+class TqdmCallback(CallbackAny2Vec):
+    """Callback to show progress bar and training loss."""
+    def __init__(self, total_epochs):
+        self.total_epochs = total_epochs
+        self.epoch = 0
+        self.loss_before = 0
+        self.start_time = 0
 
-    # 1. Load data
+    def on_epoch_begin(self, model):
+        self.epoch += 1
+        self.start_time = time.time()
+        print(f'Epoch {self.epoch}/{self.total_epochs}')
+        self.loss_before = model.get_latest_training_loss()
+
+    def on_epoch_end(self, model):
+        duration = time.time() - self.start_time
+        current_loss = model.get_latest_training_loss()
+        epoch_loss = current_loss - self.loss_before
+        print(f"Epoch finished in {duration:.2f}s. Loss: {epoch_loss}")
+
+def prepare_corpus_file(input_csv: str, output_txt: str):
+    logger.info(f"Preparing corpus file at {output_txt} from {input_csv}...")
+    with open(input_csv, 'r', encoding='utf-8') as fin, \
+         open(output_txt, 'w', encoding='utf-8') as fout:
+        
+        reader = pd.read_csv(fin, dtype=str, chunksize=1000000)
+        for chunk in tqdm(reader, desc="Converting playlists to corpus file"):
+            chunk.columns = ['playlist_id', 'song_id']
+            for _, playlist in chunk.groupby('playlist_id'):
+                fout.write(' '.join(playlist['song_id']) + '\n')
+    logger.info("Corpus file prepared.")
+
+def train_song_vectors(config: Config):
+    logger.info("--- Starting Step G0: Train Song Vectors ---")
     data_config = config.data
     w2v_config = config.word2vec
 
-    try:
-        logger.info(f"Loading playlist songs from {data_config.playlist_songs_file}...")
-        df = pd.read_csv(data_config.playlist_songs_file, dtype=str)
-        # Ensure column names are consistent
-        df.columns = ['playlist_id', 'song_id']
-    except FileNotFoundError:
-        logger.error(f"FATAL: Playlist songs file not found at {data_config.playlist_songs_file}")
-        logger.error("Please update the path in 'config.py'.")
-        return
+    temp_corpus_file = os.path.join(config.output_dir, "temp_corpus.txt")
 
-    # 2. Prepare sentences (playlists)
-    logger.info("Grouping songs into playlists (sentences)...")
-    # Group by playlist_id and collect song_ids into a list
-    sentences = df.groupby('playlist_id')['song_id'].apply(list).tolist()
-    logger.info(f"Created {len(sentences)} sentences for training.")
+    prepare_corpus_file(data_config.playlist_songs_file, temp_corpus_file)
 
-    # 3. Train Word2Vec model
-    logger.info(f"Training Word2Vec model with vector_size={w2v_config.vector_size}, window={w2v_config.window}...")
+    workers = w2v_config.workers if w2v_config.workers != -1 else os.cpu_count()
+    logger.info(f"Initializing FastText model with {workers} workers...")
     
-    # Determine number of workers
-    workers = w2v_config.workers
-    if workers == -1:
-        workers = os.cpu_count()
-        logger.info(f"Using all available CPU cores: {workers}")
-
-    model = Word2Vec(
-        sentences=sentences,
+    model = FastText(
         vector_size=w2v_config.vector_size,
         window=w2v_config.window,
         min_count=w2v_config.min_count,
-        sample=w2v_config.sample, # Add subsampling
         workers=workers,
-        epochs=w2v_config.epochs,
-        sg=0  # Use CBOW model as requested
+        sg=0,  # Use CBOW as requested
+        sample=1e-4, # Subsample frequent words
+        epochs=w2v_config.epochs
     )
-    logger.info("Word2Vec model training complete.")
 
-    # 4. Save the vectors to a CSV file
+    logger.info("Building vocabulary from corpus file...")
+    model.build_vocab(corpus_file=temp_corpus_file, progress_per=100000)
+
+    logger.info("Starting model training...")
+    model.train(
+        corpus_file=temp_corpus_file, 
+        total_examples=model.corpus_count, 
+        total_words=model.corpus_total_words, 
+        epochs=model.epochs,
+        compute_loss=True, 
+        callbacks=[TqdmCallback(model.epochs)]
+    )
+    logger.info("Training complete.")
+
     output_file = data_config.song_vectors_file
     logger.info(f"Saving {len(model.wv.index_to_key)} song vectors to {output_file}...")
-    
-    # Create a DataFrame from the learned vectors
     vectors_df = pd.DataFrame(model.wv.vectors, index=model.wv.index_to_key)
     vectors_df.columns = [f'v_{i}' for i in range(w2v_config.vector_size)]
     vectors_df.index.name = 'mixsongid'
-    
-    # Save to CSV
     vectors_df.to_csv(output_file)
 
-    # 5. Save the full model for later use (optional)
     model_output_path = os.path.join(config.model_dir, "word2vec.model")
     model.save(model_output_path)
-    logger.info(f"Full Word2Vec model saved to {model_output_path}")
-
-    logger.info(f"--- Step G0 Completed Successfully. Song vectors are ready at {output_file} ---")
+    logger.info(f"Full model saved to {model_output_path}")
+    
+    os.remove(temp_corpus_file)
+    logger.info(f"Removed temporary corpus file: {temp_corpus_file}")
+    logger.info(f"--- Step G0 Completed Successfully ---")
 
 if __name__ == "__main__":
     config = Config()
-    # Setup logging
     log_file_path = os.path.join(config.log_dir, "g0_train_word2vec.log")
     setup_logging(log_file=log_file_path)
     logger = logging.getLogger(__name__)
 
-    # Check for placeholder path
     if config.data.playlist_songs_file == "path/to/your/gen_playlist_song.csv":
-        logger.error("="*80)
         logger.error("FATAL: Please edit 'config.py' and set the path for 'playlist_songs_file'.")
-        logger.error("="*80)
         sys.exit(1)
 
     train_song_vectors(config)
