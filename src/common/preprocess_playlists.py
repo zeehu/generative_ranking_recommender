@@ -1,22 +1,21 @@
+
 """
 Step G-1 (New): Preprocess raw playlist data.
 
-This script filters playlists based on length (10 <= length <= 300)
-and converts the data into a clean corpus file where each line represents
-a full playlist (space-separated song IDs). It also saves the corresponding
-playlist IDs to a separate file and shows detailed progress.
+This script streams a large, sorted playlist file, filters playlists by length,
+and converts the data into a clean corpus file and a corresponding ID file.
+This version uses a manual for-loop for more explicit control and logging.
 """
 import os
 import sys
 import logging
 import csv
-from itertools import groupby
 from tqdm import tqdm
 
 # Add project root to sys.path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if project_root not in sys.path:
-    sys.sys.path.insert(0, project_root)
+    sys.path.insert(0, project_root)
 
 from config import Config
 from src.common.utils import setup_logging
@@ -24,7 +23,7 @@ from src.common.utils import setup_logging
 logger = logging.getLogger(__name__)
 
 def preprocess_playlist_data(config: Config):
-    logger.info("--- Starting Step G-1: Preprocessing Playlist Data (Streaming) ---")
+    logger.info("--- Starting Step G-1: Preprocessing Playlist Data (Manual Loop) ---")
     data_config = config.data
     w2v_config = config.word2vec
 
@@ -36,49 +35,55 @@ def preprocess_playlist_data(config: Config):
     logger.info(f"Streaming from {input_file} and filtering playlists with length between {min_len} and {max_len}...")
 
     try:
-        # First pass: count total number of playlists for tqdm
-        logger.info("First pass: Counting total playlists for progress bar...")
-        total_playlists = 0
+        # First, get total line count for a precise progress bar
+        logger.info("Counting total lines in source file for progress bar...")
         with open(input_file, 'r', encoding='utf-8') as f:
-            reader = csv.reader(f, delimiter='\t')
-            # Safely get the key for groupby, handling potential empty lines
-            for _ in groupby(reader, key=lambda x: x[0] if x else None):
-                total_playlists += 1
-        logger.info(f"Found {total_playlists} total groups in source file.")
+            total_lines = sum(1 for line in f)
+        logger.info(f"Found {total_lines} total lines.")
 
-        # Ensure output directory exists
         os.makedirs(os.path.dirname(output_corpus_file), exist_ok=True)
 
-        # Second pass: process and write data
-        logger.info("Second pass: Processing and writing filtered playlists...")
         with open(input_file, 'r', encoding='utf-8') as fin, \
              open(output_corpus_file, 'w', encoding='utf-8') as f_corpus, \
              open(output_ids_file, 'w', encoding='utf-8') as f_ids:
             
             reader = csv.reader(fin, delimiter='\t')
-            # Safely get the key for groupby
-            groups = groupby(reader, key=lambda x: x[0] if x else None)
             
+            current_playlist_id = None
+            current_songs = []
             processed_count = 0
-            for playlist_id, song_group in tqdm(groups, total=total_playlists, desc="Processing playlists"):
-                # Skip potential empty lines that get grouped under None key
-                if playlist_id is None:
+
+            for i, row in enumerate(tqdm(reader, total=total_lines, desc="Processing lines")):
+                if len(row) < 2:
+                    logger.warning(f"Skipping malformed row {i+1}: {row}")
                     continue
                 
-                # Safely build the song list, checking for rows with at least 2 columns
-                song_list = [song[1] for song in song_group if len(song) > 1]
-                
-                # Apply length filter
-                if min_len <= len(song_list) <= max_len:
-                    f_corpus.write(' '.join(song_list) + '\n')
-                    f_ids.write(str(playlist_id) + '\n')
-                    processed_count += 1
-        
+                playlist_id, song_id = row[0], row[1]
+
+                if playlist_id != current_playlist_id:
+                    # A new playlist has started, process the previous one
+                    if current_playlist_id is not None and min_len <= len(current_songs) <= max_len:
+                        f_corpus.write(' '.join(current_songs) + '\n')
+                        f_ids.write(str(current_playlist_id) + '\n')
+                        processed_count += 1
+                    
+                    # Start the new playlist
+                    current_playlist_id = playlist_id
+                    current_songs = [song_id]
+                else:
+                    # Continue adding to the current playlist
+                    current_songs.append(song_id)
+            
+            # Process the very last playlist in the file
+            if current_playlist_id is not None and min_len <= len(current_songs) <= max_len:
+                f_corpus.write(' '.join(current_songs) + '\n')
+                f_ids.write(str(current_playlist_id) + '\n')
+                processed_count += 1
+
         logger.info(f"Processing complete. Wrote {processed_count} playlists to output files.")
 
     except FileNotFoundError:
         logger.error(f"FATAL: Sorted playlist file not found at {input_file}")
-        logger.error("Please ensure the file is sorted and the path in config.py is correct.")
         sys.exit(1)
     except Exception as e:
         logger.error(f"An unexpected error occurred: {e}")
