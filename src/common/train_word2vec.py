@@ -26,17 +26,14 @@ class TqdmCallback(CallbackAny2Vec):
     def __init__(self, total_epochs):
         self.total_epochs = total_epochs
         self.epoch = 0
-        self.loss_before = 0
-
-    def on_epoch_begin(self, model):
-        self.epoch += 1
-        print(f'Epoch {self.epoch}/{self.total_epochs}')
-        self.loss_before = model.get_latest_training_loss()
+        self.loss_before = 0.0
 
     def on_epoch_end(self, model):
         current_loss = model.get_latest_training_loss()
         epoch_loss = current_loss - self.loss_before
-        print(f"Epoch finished. Loss: {epoch_loss}")
+        self.loss_berfore = epoch_loss
+        print(f"Epoch {self.epoch}/{self.total_epochs} finished. Loss: {epoch_loss}")
+        self.epoch += 1
 
 def train_song_vectors(config: Config):
     logger.info("--- Starting Step G0: Train Song Vectors ---")
