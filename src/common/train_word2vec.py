@@ -67,16 +67,16 @@ def train_song_vectors(config: Config):
     logger.info(f"Initializing Word2Vec model with {workers} workers...")
     
     model = Word2Vec(
-        sentences,
+        corpus_iterable=sentences,
         vector_size=w2v_config.vector_size,
         window=w2v_config.window,
         min_count=w2v_config.min_count,
         workers=workers,
-        sg=0,  # Use CBOW
-        sample=1e-4,
+        sg=1,  # Switch to Skip-gram for better quality on rare words
+        sample=w2v_config.sample, # Use configured subsampling rate
         epochs=w2v_config.epochs,
-        #compute_loss=True,
-        #callbacks=[TqdmCallback(w2v_config.epochs)]
+        compute_loss=True,
+        callbacks=[TqdmCallback(w2v_config.epochs)]
     )
     logger.info("Word2Vec model training complete.")
 

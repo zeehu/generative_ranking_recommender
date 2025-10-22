@@ -27,7 +27,8 @@ class Word2VecConfig:
     min_count: int = 5          # Ignores all songs with total frequency lower than this.
     sample: float = 1e-4        # Subsampling threshold for frequent words.
     workers: int = -1           # Use all available CPU cores, -1 means all.
-    epochs: int = 3             # Reduced epochs for large corpus.
+    epochs: int = 5             # Increased epochs for better quality.
+    sample: float = 1e-5        # More aggressive subsampling for frequent words.
 
 @dataclass
 class SongRQKMeansConfig:
