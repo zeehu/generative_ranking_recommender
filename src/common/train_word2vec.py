@@ -47,16 +47,19 @@ def train_song_vectors(config: Config):
         sys.exit(1)
 
     workers = w2v_config.workers if w2v_config.workers != -1 else os.cpu_count()
-    logger.info(f"Initializing FastText model with {workers} workers...")
+    logger.info(f"Initializing Word2Vec model with {workers} workers...")
     
-    # Initialize the model. It will read the corpus later.
-    model = FastText(
+    model = Word2Vec(
+        corpus_iterable=sentences,
         vector_size=w2v_config.vector_size,
         window=w2v_config.window,
         min_count=w2v_config.min_count,
         workers=workers,
         sg=0,  # Use CBOW
-        sample=1e-4
+        sample=1e-4,
+        epochs=w2v_config.epochs,
+        callbacks=[TqdmCallback(w2v_config.epochs)],
+        compute_loss=True
     )
 
     logger.info(f"Building vocabulary from {corpus_file}...")
