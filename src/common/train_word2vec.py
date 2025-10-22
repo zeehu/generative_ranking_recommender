@@ -82,11 +82,11 @@ def train_song_vectors(config: Config):
     # 3. Save the vectors to a CSV file
     output_file = data_config.song_vectors_file
     logger.info(f"Saving {len(model.wv.index_to_key)} song vectors to {output_file}...")
-    with open(output_file, 'w', encoding='utf-8') as f:
-        # No header, tab-separated
+    with open(output_file, 'w', encoding='utf-8', newline='') as f:
+        writer = csv.writer(f, delimiter='\t')
         for song_id in model.wv.index_to_key:
             vector = model.wv[song_id]
-            f.write(f"{song_id}\t{'\t'.join(map(str, vector))}\n")
+            writer.writerow([song_id] + vector.tolist())
 
     # 4. Save the full model
     model_output_path = os.path.join(config.model_dir, "word2vec.model")
