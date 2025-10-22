@@ -23,11 +23,11 @@ class Word2VecConfig:
     corpus_file: str = "outputs/playlists_corpus.txt" # Path to the preprocessed corpus
     corpus_ids_file: str = "outputs/playlists_corpus.ids.txt" # Path to the corresponding playlist IDs
     vector_size: int = 256      # Dimensionality of the song vectors.
-    window: int = 100          # Increased context window size.
+    window: int = 20           # Context window size.
     min_count: int = 5          # Ignores all songs with total frequency lower than this.
     sample: float = 1e-4        # Subsampling threshold for frequent words.
     workers: int = -1           # Use all available CPU cores, -1 means all.
-    epochs: int = 10            # Number of iterations over the corpus.
+    epochs: int = 3             # Reduced epochs for large corpus.
 
 @dataclass
 class SongRQKMeansConfig:
