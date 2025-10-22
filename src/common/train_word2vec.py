@@ -12,6 +12,7 @@ import logging
 import time
 from gensim.models import Word2Vec
 from gensim.models.callbacks import CallbackAny2Vec
+import csv
 
 # Add project root to sys.path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
@@ -66,7 +67,7 @@ def train_song_vectors(config: Config):
     logger.info(f"Initializing Word2Vec model with {workers} workers...")
     
     model = Word2Vec(
-        corpus_iterable=sentences,
+        sentences,
         vector_size=w2v_config.vector_size,
         window=w2v_config.window,
         min_count=w2v_config.min_count,
@@ -74,8 +75,8 @@ def train_song_vectors(config: Config):
         sg=0,  # Use CBOW
         sample=1e-4,
         epochs=w2v_config.epochs,
-        compute_loss=True,
-        callbacks=[TqdmCallback(w2v_config.epochs)]
+        #compute_loss=True,
+        #callbacks=[TqdmCallback(w2v_config.epochs)]
     )
     logger.info("Word2Vec model training complete.")
 
