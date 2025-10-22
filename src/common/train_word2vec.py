@@ -23,46 +23,56 @@ from src.common.utils import setup_logging
 
 logger = logging.getLogger(__name__)
 
+class PlaylistCorpus:
+    """An iterator that yields sentences (playlists) from a pre-processed text file."""
+    def __init__(self, filepath):
+        self.filepath = filepath
+
+    def __iter__(self):
+        try:
+            with open(self.filepath, 'r', encoding='utf-8') as f:
+                for line in f:
+                    yield line.split()
+        except FileNotFoundError:
+            logger.error(f"FATAL: Corpus file not found at {self.filepath}")
+            logger.error("Please run Step G0a (preprocess_playlists.py) first.")
+            raise
+
 def train_song_vectors(config: Config):
     logger.info("--- Starting Step G0b: Train Song Vectors ---")
     data_config = config.data
     w2v_config = config.word2vec
 
+    # 1. Initialize a corpus iterator from the pre-processed file
     corpus_file = w2v_config.corpus_file
-    if not os.path.exists(corpus_file):
-        logger.error(f"FATAL: Corpus file not found at {corpus_file}")
-        logger.error("Please run Step G0a (preprocess_playlists.py) first.")
-        sys.exit(1)
+    sentences = PlaylistCorpus(corpus_file)
 
+    # 2. Train Word2Vec model
     workers = w2v_config.workers if w2v_config.workers != -1 else os.cpu_count()
-    logger.info(f"Initializing and training Word2Vec model with {workers} workers...")
-    start_time = time.time()
-
-    # Use the corpus_file argument for memory-efficient training
+    logger.info(f"Initializing Word2Vec model with {workers} workers...")
+    
     model = Word2Vec(
-        corpus_file=corpus_file,
+        sentences,
         vector_size=w2v_config.vector_size,
         window=w2v_config.window,
         min_count=w2v_config.min_count,
         workers=workers,
-        sg=1,  # Skip-gram for quality
+        sg=0,  # Use 0:CBOW,1:Skip-gram
         sample=w2v_config.sample,
         epochs=w2v_config.epochs
     )
-    
-    end_time = time.time()
-    logger.info(f"Word2Vec model training complete in {end_time - start_time:.2f} seconds.")
+    logger.info("Word2Vec model training complete.")
 
-    # Save the vectors to a CSV file
+    # 3. Save the vectors to a CSV file
     output_file = data_config.song_vectors_file
     logger.info(f"Saving {len(model.wv.index_to_key)} song vectors to {output_file}...")
     with open(output_file, 'w', encoding='utf-8', newline='') as f:
-        writer = csv.writer(f, delimiter='\t')
+        writer = csv.writer(f, delimiter=',')
         for song_id in model.wv.index_to_key:
             vector = model.wv[song_id]
             writer.writerow([song_id] + vector.tolist())
 
-    # Save the full model
+    # 4. Save the full model
     model_output_path = os.path.join(config.model_dir, "word2vec.model")
     model.save(model_output_path)
     logger.info(f"Full model saved to {model_output_path}")
@@ -76,3 +86,4 @@ if __name__ == "__main__":
     logger = logging.getLogger(__name__)
 
     train_song_vectors(config)
+    

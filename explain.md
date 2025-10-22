@@ -51,3 +51,119 @@
 
 
   这样，我们既利用了生成模型的“创造力”和“上下文感知能力”，又利用了排序模型的“精准判别能力”，最终得到一个既连贯又有惊喜、且每首歌都高度相关的完美结果。
+  
+
+- ** SQL **
+- 统计song
+```
+WITH FilteredSonglists AS (
+    SELECT glid
+    FROM dal.search_release_songlist_d
+    WHERE dt = '2025-10-20'
+      AND status = '1'
+      AND (collect_type IN ('1', '2') OR feat = '1')
+),
+FilteredMappings AS (
+    SELECT DISTINCT m.mixsongid
+    FROM dal_search.special_gid_map_mixsongid_info_rain m
+    JOIN FilteredSonglists fs ON m.special_gid = fs.glid
+    WHERE m.dt = '2025-10-20'
+)
+SELECT
+    song.mixsongid,
+    song.songname,                                                                                                                                                                                                                                 
+    song.choric_singer
+FROM
+    common.st_k_mixsong_part song
+JOIN
+    FilteredMappings fm ON song.mixsongid = fm.mixsongid
+WHERE
+    song.dt = '2025-10-20'
+```
+
+```
+SELECT
+    r_s.mixsongid,
+    r_s.songname,
+    r_s.choric_singer
+FROM
+    common.st_k_mixsong_part r_s
+JOIN
+(
+  SELECT mixsongid
+  FROM common.st_k_mixsong_part
+  WHERE dt='2025-10-19' AND CAST(ownercount AS INT) > 50
+  UNION
+  SELECT mixsongid
+  FROM dal_search.search_doc_info_simple
+  WHERE dt='2025-10-19' AND collect_uv > 4000
+) s
+ON r_s.mixsongid = s.mixsongid
+WHERE
+    r_s.dt = '2025-10-19'
+```
+
+- 统计playlist-song
+```
+WITH FilteredSonglists AS (
+    SELECT glid
+    FROM dal.search_release_songlist_d
+    WHERE dt = '2025-10-20'
+      AND status = '1'
+      AND (collect_type IN ('1', '2') OR feat = '1')
+)
+
+SELECT fs.glid, m.mixsongid
+FROM dal_search.special_gid_map_mixsongid_info_rain m
+JOIN FilteredSonglists fs ON m.special_gid = fs.glid
+WHERE m.dt = '2025-10-20'
+ORDER BY fs.glid
+```
+```
+SELECT pl.special_gid, pl.mixsongid
+FROM
+    dal_search.special_gid_map_mixsongid_info_rain pl
+JOIN
+(
+    SELECT mixsongid
+    FROM common.st_k_mixsong_part
+    WHERE dt='2025-10-19' AND CAST(ownercount AS INT) > 50
+
+    UNION
+
+    SELECT mixsongid
+    FROM dal_search.search_doc_info_simple
+    WHERE dt='2025-10-19' AND collect_uv > 4000
+) s
+ON pl.mixsongid=s.mixsongid
+WHERE pl.dt='2025-10-19'
+ORDER BY pl.special_gid
+```
+
+- 统计playlist
+```
+SELECT glid,listname,nickname,tag_list,feat,collect_type,play_count
+FROM dal.search_release_songlist_d rpl
+JOIN
+(
+    SELECT DISTINCT pl.special_gid
+    FROM
+    dal_search.special_gid_map_mixsongid_info_rain pl
+    JOIN
+    (
+        SELECT mixsongid
+        FROM common.st_k_mixsong_part
+        WHERE dt='2025-10-19' AND CAST(ownercount AS INT) > 50
+
+        UNION
+
+        SELECT mixsongid
+        FROM dal_search.search_doc_info_simple
+        WHERE dt='2025-10-19' AND collect_uv > 4000
+    ) s
+    ON pl.mixsongid=s.mixsongid
+    WHERE pl.dt='2025-10-19'
+) pl_s
+ON rpl.glid=pl_s.special_gid
+WHERE dt = '2025-10-19'
+```

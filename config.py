@@ -9,9 +9,9 @@ from typing import List
 class DataConfig:
     """Configuration for data paths and processing."""
     # --- Paths to be filled by user ---
-    playlist_songs_file: str = "path/to/your/gen_playlist_song.csv"
-    playlist_info_file: str = "path/to/your/gen_playlist_info.csv"
-    song_info_file: str = "path/to/your/gen_song_info.csv"
+    playlist_songs_file: str = "data/gen_playlist_song.csv.sort"
+    playlist_info_file: str = "data/gen_playlist_info.csv"
+    song_info_file: str = "data/gen_song_info.csv"
     
     # --- Paths for generated files (outputs of steps) ---
     song_vectors_file: str = "outputs/song_vectors.csv"
@@ -23,11 +23,10 @@ class Word2VecConfig:
     corpus_file: str = "outputs/playlists_corpus.txt" # Path to the preprocessed corpus
     corpus_ids_file: str = "outputs/playlists_corpus.ids.txt" # Path to the corresponding playlist IDs
     vector_size: int = 256      # Dimensionality of the song vectors.
-    window: int = 20           # Context window size.
+    window: int = 100           # Context window size.
     min_count: int = 5          # Ignores all songs with total frequency lower than this.
-    sample: float = 1e-4        # Subsampling threshold for frequent words.
     workers: int = -1           # Use all available CPU cores, -1 means all.
-    epochs: int = 5             # Increased epochs for better quality.
+    epochs: int = 10             # Increased epochs for better quality.
     sample: float = 1e-5        # More aggressive subsampling for frequent words.
 
 @dataclass
