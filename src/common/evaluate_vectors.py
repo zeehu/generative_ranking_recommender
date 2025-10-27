@@ -79,7 +79,8 @@ def main(config: Config):
     # 1. Load Vectors
     logger.info(f"Loading song vectors from {data_config.song_vectors_file}...")
     try:
-        vectors_df = pd.read_csv(data_config.song_vectors_file, dtype={'song_id': str})
+        vectors_df = pd.read_csv(data_config.song_vectors_file, header=None, dtype={0: str})
+        vectors_df.rename(columns={0: 'song_id'}, inplace=True)
         vectors_df.set_index('song_id', inplace=True)
     except FileNotFoundError:
         logger.error(f"FATAL: {data_config.song_vectors_file} not found. Run train_word2vec.py first.")
