@@ -5,6 +5,7 @@ import os
 import os.path as osp
 import pickle
 import csv
+import json
 from tqdm.auto import tqdm
 from dataclasses import dataclass, field
 from typing import List, Dict
@@ -319,18 +320,20 @@ class SimplifiedHierarchicalRQ:
         return model
 
     def save_semantic_ids(self, output_file: str):
-        """Saves the generated song_id -> semantic_id mapping."""
+        """Saves the generated song_id -> semantic_id mapping in JSONL format."""
         if not hasattr(self, 'semantic_ids'):
             print("No semantic IDs generated yet. Run train() or predict() first.")
             return
             
         print(f"Saving semantic IDs to {output_file}...")
         unique_ids = set()
-        with open(output_file, 'w') as f:
+        with open(output_file, 'w', encoding='utf-8') as f:
             for song_id, ids in self.semantic_ids.items():
-                id_str = "\t".join(map(str, ids))
-                f.write(f"{song_id}\t{id_str}\n")
-                unique_ids.add(id_str)
+                # Create a dictionary for the JSON object
+                data = {"song_id": song_id, "semantic_ids": ids}
+                # Write the JSON string followed by a newline
+                f.write(json.dumps(data) + '\n')
+                unique_ids.add(tuple(ids))
         
         print(f"Saved {len(self.semantic_ids)} total IDs.")
         print(f"Found {len(unique_ids)} unique semantic IDs.")
@@ -361,7 +364,8 @@ if __name__ == '__main__':
 
         # 4. Define save paths and save the model and results
         model_save_path = osp.join(output_dir, "semantic_rq_model.pkl")
-        results_save_path = osp.join(output_dir, "semantic_ids.txt")
+        # Use the project-standard filename
+        results_save_path = osp.join(output_dir, "song_semantic_ids.jsonl")
         
         model.save_model(model_save_path)
         model.save_semantic_ids(results_save_path)
