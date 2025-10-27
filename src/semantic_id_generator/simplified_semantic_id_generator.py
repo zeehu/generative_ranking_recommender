@@ -10,17 +10,7 @@ from tqdm.auto import tqdm
 from dataclasses import dataclass, field
 from typing import List, Dict
 
-# Assuming balancekmeans is in the python path
-# You might need to adjust sys.path if it's not installed
-try:
-    from balancekmeans import KMeans, pairwise_distance_full
-except ImportError:
-    # If balancekmeans is not in the standard path, add its location.
-    # This is based on the original script's structure.
-    import sys
-    # Adjust this path to where the 'BalanceRqKMeans' directory is relative to your project root
-    sys.path.append(osp.abspath(osp.join(__file__, '../../..')))
-    from BalanceRqKMeans.balancekmeans import KMeans, pairwise_distance_full
+from .balancekmeans import KMeans, pairwise_distance_full
 
 
 @dataclass
