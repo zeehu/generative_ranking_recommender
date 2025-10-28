@@ -2,7 +2,7 @@
 import torch
 import numpy as np
 import os
-import os.path as osp
+import sysimport os.path as osp
 import pickle
 import csv
 import json
@@ -10,7 +10,12 @@ from tqdm.auto import tqdm
 from dataclasses import dataclass, field
 from typing import List, Dict
 
-from .balancekmeans import KMeans, pairwise_distance_full
+# Add project root to sys.path to allow for absolute imports from `src`
+project_root = osp.abspath(osp.join(osp.dirname(__file__), '..', '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+from src.semantic_id_generator.balancekmeans import KMeans, pairwise_distance_full
 
 
 @dataclass
@@ -98,6 +103,71 @@ class SimplifiedHierarchicalRQ:
 
         return torch.cat(residuals)
 
+    def _train_middle_layer(self, data: torch.Tensor, prev_cluster_ids: torch.Tensor, layer_idx: int) -> (torch.Tensor, torch.Tensor):
+        """Trains a middle layer using the recursive approach from the original script."""
+        print("Training middle layer with recursive approach...")
+        n_clusters = self.config.layer_clusters[layer_idx]
+        n_need = self.config.need_clusters[layer_idx]
+        prev_n_need = self.config.need_clusters[layer_idx - 1]
+        use_half = n_clusters > 512
+
+        all_sub_centers = []
+        # For each cluster in the previous layer, train a new KMeans on its members.
+        for i in tqdm(range(prev_n_need), desc=f"Sub-training Layer {layer_idx + 1}"):
+            subgroup_indices = torch.where(prev_cluster_ids == i)[0]
+            if len(subgroup_indices) == 0:
+                # This shouldn't happen with balanced k-means, but as a fallback...
+                continue
+            
+            sub_data = data[subgroup_indices].to(self.device)
+
+            # Here, we train n_clusters and then would ideally select n_need.
+            # The original logic was complex. A robust simplification is to train n_need directly.
+            sub_kmeans = KMeans(n_clusters=n_need, device=self.device, balanced=True)
+            sub_kmeans.fit(X=sub_data, iter_limit=self.config.iter_limit, half=use_half, tqdm_flag=False)
+            all_sub_centers.append(sub_kmeans.cluster_centers)
+
+        # Combine all the centers from the sub-models
+        combined_centers = torch.cat(all_sub_centers).to(self.device)
+        self.middle_layer_centers = combined_centers # Save for prediction
+
+        # Use the combined centers to predict for the whole dataset
+        # This requires a custom prediction/residual calculation logic
+        final_ids = []
+        residuals = []
+        batch_size = 100000
+
+        for i in tqdm(range(0, len(data), batch_size), desc="Mid-layer Prediction"):
+            batch_data = data[i:i+batch_size].to(self.device)
+            batch_prev_ids = prev_cluster_ids[i:i+batch_size].to(self.device)
+
+            dist = pairwise_distance_full(batch_data, combined_centers)
+
+            # Create a mask to only allow assignment to sub-centers
+            # A data point from previous cluster `j` can only be assigned to the `j`-th block of centers.
+            mask = torch.ones_like(dist) * float('inf')
+            for j in range(prev_n_need):
+                rows_for_j = (batch_prev_ids == j)
+                if rows_for_j.any():
+                    start_idx, end_idx = j * n_need, (j + 1) * n_need
+                    mask[rows_for_j, start_idx:end_idx] = 0
+            
+            dist += mask
+            batch_cluster_ids = torch.argmin(dist, dim=1)
+            final_ids.append(batch_cluster_ids)
+
+            # Calculate residuals based on the assigned centers
+            with torch.no_grad():
+                assigned_centers = combined_centers[batch_cluster_ids]
+                residual = batch_data - assigned_centers
+                residuals.append(residual.cpu())
+
+        final_ids = torch.cat(final_ids)
+        # The final IDs are global; map them back to be 0-127 within their group
+        final_ids = final_ids % n_need
+        
+        return final_ids, torch.cat(residuals)
+
     def train(self, data_path: str):
         """
         Trains the full hierarchical RQ model.
@@ -108,16 +178,17 @@ class SimplifiedHierarchicalRQ:
         all_layer_ids: Dict[str, List[int]] = {sid: [] for sid in song_ids}
         previous_level_ids = None
 
-        for layer_idx, (n_clusters, n_need) in enumerate(zip(self.config.layer_clusters, self.config.need_clusters)):
+        for layer_idx in range(len(self.config.layer_clusters)):
             print(f"--- Training Layer {layer_idx + 1}/{len(self.config.layer_clusters)} ---")
-            
+            n_clusters = self.config.layer_clusters[layer_idx]
+            n_need = self.config.need_clusters[layer_idx]
             use_half = n_clusters > 512
-            
-            kmeans = KMeans(n_clusters=n_clusters, device=self.device, balanced=True)
 
-            # Layer-specific training logic
+            # --- Layer-specific training logic ---
             if layer_idx == 0:
-                # First layer uses fit_by_min_loss to control cluster size
+                # FIRST LAYER
+                print("Training first layer...")
+                kmeans = KMeans(n_clusters=n_clusters, device=self.device, balanced=True)
                 target_nodes = np.prod(self.config.need_clusters[1:])
                 kmeans.fit_by_min_loss(
                     X=current_data, target_nodes_num=target_nodes, iter_limit=self.config.iter_limit, half=use_half
@@ -125,21 +196,15 @@ class SimplifiedHierarchicalRQ:
                 self.trained_kmeans_models.append(kmeans)
                 cluster_ids = kmeans.predict(current_data.to(self.device))
 
-            elif n_clusters == n_need: # Middle layers (if they exist and are simple)
-                # This is a recursive-style training within each previous cluster
-                # Note: The original code had complex recursive logic. This is a simplified placeholder.
-                # For a true recursive implementation, one would train a separate KMeans for each parent cluster.
-                # Here, we train one large KMeans, which is a simplification.
-                print("Training a single KMeans for the whole layer (simplified approach).")
-                kmeans.fit(X=current_data, iter_limit=self.config.iter_limit, half=use_half)
-                self.trained_kmeans_models.append(kmeans)
-                cluster_ids = kmeans.predict(current_data.to(self.device))
+            elif layer_idx < len(self.config.layer_clusters) - 1:
+                # MIDDLE LAYER(S)
+                # This is the re-implementation of the more complex recursive logic
+                cluster_ids, residuals = self._train_middle_layer(current_data, previous_level_ids, layer_idx)
+                current_data = residuals # This is the residual for the next layer
+                self.trained_kmeans_models.append(None) # Middle layer has no single model
 
-            else: # Final layer with dynamic center selection
+            else: # FINAL LAYER
                 print("Training final layer with dynamic center selection...")
-                # This part is complex, retaining the original logic.
-                
-                # 1. Train multiple KMeans to create a large pool of candidate centers
                 kmeans_part1 = KMeans(n_clusters=n_clusters, device=self.device, balanced=True)
                 kmeans_part1.fit(X=current_data, iter_limit=20, half=use_half)
                 
@@ -148,18 +213,14 @@ class SimplifiedHierarchicalRQ:
 
                 candidate_centers = torch.cat([kmeans_part1.cluster_centers, kmeans_part2.cluster_centers], dim=0)
                 self.final_layer_centers = candidate_centers
-                self.trained_kmeans_models.append(None) # Placeholder for final layer model
+                self.trained_kmeans_models.append(None)
 
-                # 2. Assign a unique subset of centers for each subgroup from previous layers
-                # This requires IDs from the two previous layers
                 prev_ids_l1 = torch.tensor([all_layer_ids[sid][layer_idx-2] for sid in song_ids])
                 prev_ids_l2 = torch.tensor([all_layer_ids[sid][layer_idx-1] for sid in song_ids])
 
                 self.dynamic_match_matrix = self._get_dynamic_match_matrix(
                     current_data, prev_ids_l1, prev_ids_l2, candidate_centers
                 )
-
-                # 3. Assign clusters based on the dynamic matrix
                 cluster_ids = self._predict_with_dynamic_matrix(
                     current_data, prev_ids_l1, prev_ids_l2, candidate_centers, self.dynamic_match_matrix
                 )
@@ -168,22 +229,15 @@ class SimplifiedHierarchicalRQ:
             current_ids_np = cluster_ids.cpu().numpy()
             for i, song_id in enumerate(song_ids):
                 all_layer_ids[song_id].append(current_ids_np[i])
-            
             previous_level_ids = cluster_ids
 
-            # Calculate residuals for the next layer
-            if layer_idx < len(self.config.layer_clusters) - 1:
+            # --- Calculate residuals for the next layer (if not final layer) ---
+            if layer_idx == 0: # Only for the first layer, as others handle residuals internally
                 print("Calculating residuals for next layer...")
-                # The 'kmeans' object needs to be correctly set for residual calculation
-                # For the dynamic layer, we need a different way to get the center for each point
-                if self.dynamic_match_matrix is not None and layer_idx == len(self.config.layer_clusters) - 2:
-                    # This case is complex as we don't have one single kmeans model.
-                    # We'd need to calculate residuals based on the dynamically assigned centers.
-                    # For simplification, we'll stop residual calculation before the final dynamic layer in this version.
-                    print("Skipping residual calculation after dynamic layer for simplicity.")
-                    current_data = None 
-                else:
-                    current_data = self._get_residuals(current_data, kmeans)
+                current_data = self._get_residuals(current_data, self.trained_kmeans_models[0])
+            
+        self.semantic_ids = all_layer_ids
+        print("Training complete.")
             
         self.semantic_ids = all_layer_ids
         print("Training complete.")
