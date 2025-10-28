@@ -409,7 +409,7 @@ if __name__ == '__main__':
         if TEST_DATA_LIMIT is not None:
             print(f"--- RUNNING IN TEST MODE (First {TEST_DATA_LIMIT} rows) ---")
             # Use a smaller configuration suitable for 10k data to ensure fast execution
-            config = HierarchicalRQConfig(
+            config_for_rq = HierarchicalRQKMeansConfig(
                 layer_clusters=[32, 32, 64],
                 need_clusters=[32, 32, 8],
                 embedding_dim=256,
@@ -418,9 +418,16 @@ if __name__ == '__main__':
         else:
             print("--- RUNNING IN PRODUCTION MODE (Full Dataset) ---")
             # Use the default configuration optimized for 1.8M data
-            config = HierarchicalRQConfig()
+            config_for_rq = HierarchicalRQKMeansConfig(
+                layer_clusters=[128, 1280, 2560],
+                need_clusters=[128, 128, 256],
+                embedding_dim=256,
+                iter_limit=100
+            )
 
-        model = SimplifiedHierarchicalRQ(config)
+        # Instantiate the main Config object to get file paths
+        main_config = Config()
+        model = SimplifiedHierarchicalRQ(config_for_rq)
 
         # 3. Train the model, passing the data limit for testing
         model.train(data_path=input_csv_path, data_limit=TEST_DATA_LIMIT)
