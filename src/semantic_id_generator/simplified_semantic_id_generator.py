@@ -49,28 +49,32 @@ class SimplifiedHierarchicalRQ:
         self.middle_layer_centers = None # For recursive layers
         print(f"Initialized SimplifiedHierarchicalRQ on device: {self.device}")
 
-    def _load_data(self, data_path: str) -> (List[str], torch.Tensor):
+    def _load_data(self, data_path: str, limit: int = None) -> (List[str], torch.Tensor):
         """
-        Loads all song embeddings from a single CSV file with no header.
+        Loads song embeddings from a single CSV file with no header.
         Format: song_id,dim_1,dim_2,...,dim_N
         """
         song_ids, embeddings = [], []
         print(f"Loading data from CSV file (no header): {data_path}...")
+        if limit:
+            print(f"NOTE: Loading only the first {limit} rows for testing.")
 
         if not osp.isfile(data_path):
             raise FileNotFoundError(f"The specified data file was not found: {data_path}")
 
         with open(data_path, 'r', encoding='utf-8') as f:
             reader = csv.reader(f)
-            for row in tqdm(reader, desc="Reading rows from CSV"):
+            for i, row in enumerate(tqdm(reader, desc="Reading rows from CSV")):
+                if limit and i >= limit:
+                    print(f"Data loading limit of {limit} rows reached.")
+                    break
+
                 if len(row) < 2: continue
                 
                 song_id = row[0]
-                # Convert all subsequent columns to a numpy array of floats
                 try:
                     embed = np.array(row[1:], dtype=np.float32)
                 except ValueError:
-                    # Skip row if vector part contains non-numeric data
                     print(f"Skipping row for song_id {song_id} due to non-numeric vector data.")
                     continue
 
@@ -81,7 +85,6 @@ class SimplifiedHierarchicalRQ:
         if not song_ids:
             raise ValueError("No valid data with the correct embedding dimension found in the CSV file.")
         
-        # Use half precision if any layer has a large number of clusters
         use_half = any(n > 512 for n in self.config.layer_clusters)
         tensor_embeddings = torch.from_numpy(np.vstack(embeddings))
         return song_ids, tensor_embeddings.half() if use_half else tensor_embeddings.float()
@@ -168,11 +171,11 @@ class SimplifiedHierarchicalRQ:
         
         return final_ids, torch.cat(residuals)
 
-    def train(self, data_path: str):
+    def train(self, data_path: str, data_limit: int = None):
         """
         Trains the full hierarchical RQ model.
         """
-        song_ids, embeddings = self._load_data(data_path)
+        song_ids, embeddings = self._load_data(data_path, limit=data_limit)
         current_data = embeddings
         
         all_layer_ids: Dict[str, List[int]] = {sid: [] for sid in song_ids}
@@ -390,6 +393,11 @@ if __name__ == '__main__':
     input_csv_path = "outputs/song_vectors.csv"
     output_dir = "outputs/semantic_id"
     
+    # --- FOR TESTING: Set a limit on the number of rows to load ---
+    # --- Set to None to load all 1.8 million rows for a full run ---
+    TEST_DATA_LIMIT = 10000  # Load only 10,000 songs for a quick test run
+    # TEST_DATA_LIMIT = None # Uncomment this for a full production run
+
     print(f"--- Starting Semantic ID Generation ---")
     print(f"Input file: {input_csv_path}")
     print(f"Output directory: {output_dir}")
@@ -398,17 +406,15 @@ if __name__ == '__main__':
     os.makedirs(output_dir, exist_ok=True)
 
     # 2. Initialize model with configuration optimized for large-scale data
-    # The config defaults are already set for this purpose.
     try:
         config = HierarchicalRQConfig()
         model = SimplifiedHierarchicalRQ(config)
 
-        # 3. Train the model using data from the CSV file
-        model.train(data_path=input_csv_path)
+        # 3. Train the model, passing the data limit for testing
+        model.train(data_path=input_csv_path, data_limit=TEST_DATA_LIMIT)
 
         # 4. Define save paths and save the model and results
         model_save_path = osp.join(output_dir, "semantic_rq_model.pkl")
-        # Use the project-standard filename
         results_save_path = osp.join(output_dir, "song_semantic_ids.jsonl")
         
         model.save_model(model_save_path)
