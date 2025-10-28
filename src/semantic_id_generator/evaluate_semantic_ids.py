@@ -1,0 +1,205 @@
+"""
+Interactive script to evaluate the quality of generated semantic IDs.
+
+This tool allows you to pick a song and find its nearest neighbors within the
+same semantic cluster (at the first level), ranked by cosine similarity of their
+original vectors. This provides a qualitative measure of the clustering quality.
+"""
+import os
+import sys
+import json
+import csv
+import numpy as np
+import torch
+from tqdm import tqdm
+from collections import defaultdict
+
+# Add project root to sys.path to allow for absolute imports
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+class Evaluator:
+    def __init__(self, semantic_id_path, vectors_path, song_info_path):
+        print("--- Semantic ID Quality Evaluator ---")
+        self.song_info = self._load_song_info(song_info_path)
+        self.song_vectors = self._load_song_vectors(vectors_path)
+        self.semantic_ids, self.l1_clusters = self._load_semantic_ids(semantic_id_path)
+
+        if not self.song_info or not self.song_vectors or not self.semantic_ids:
+            raise RuntimeError("Failed to load necessary files. Please check paths.")
+
+        print("\nInitialization complete. Evaluator is ready.")
+
+    def _load_song_info(self, path):
+        print(f"Loading song info from: {path}")
+        info = {}
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                reader = csv.reader(f, delimiter='\t')
+                for row in tqdm(reader, desc="Reading song info"):
+                    if len(row) >= 3:
+                        info[row[0]] = {"name": row[1], "singer": row[2]}
+        except FileNotFoundError:
+            print(f"Warning: Song info file not found at {path}. Output will not contain names.")
+        return info
+
+    def _load_song_vectors(self, path):
+        print(f"Loading song vectors from: {path}")
+        vectors = {}
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                reader = csv.reader(f)
+                for row in tqdm(reader, desc="Reading song vectors"):
+                    if len(row) > 1:
+                        vectors[row[0]] = np.array(row[1:], dtype=np.float32)
+        except FileNotFoundError:
+            print(f"ERROR: Song vectors file not found at {path}.")
+        return vectors
+
+    def _load_semantic_ids(self, path):
+        print(f"Loading semantic IDs from: {path}")
+        s_ids = {}
+        l1_clusters = defaultdict(list)
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                for line in tqdm(f, desc="Reading semantic IDs"):
+                    item = json.loads(line)
+                    song_id = item['song_id']
+                    sem_id_tuple = tuple(item['semantic_ids'])
+                    s_ids[song_id] = sem_id_tuple
+                    if sem_id_tuple:
+                        l1_clusters[sem_id_tuple[0]].append(song_id)
+        except FileNotFoundError:
+            print(f"ERROR: Semantic ID file not found at {path}.")
+        return s_ids, l1_clusters
+
+    def find_neighbors(self, target_song_id: str, top_n: int = 10):
+        """Finds and prints the nearest neighbors for a given song ID."""
+        if target_song_id not in self.semantic_ids:
+            print(f"Error: Song ID '{target_song_id}' not found in the semantic ID mapping.")
+            return
+        
+        target_sem_id = self.semantic_ids[target_song_id]
+        target_vector = self.song_vectors.get(target_song_id)
+        target_info = self.song_info.get(target_song_id, {"name": "N/A", "singer": "N/A"})
+
+        if target_vector is None:
+            print(f"Error: Vector for song ID '{target_song_id}' not found.")
+            return
+
+        print("\n" + "-"*80)
+        print(f"Target Song: {target_info['name']} - {target_info['singer']} (ID: {target_song_id})")
+        print(f"Semantic ID: {target_sem_id}")
+        print("-"*80)
+
+        l1_cluster_id = target_sem_id[0]
+        neighbor_song_ids = self.l1_clusters.get(l1_cluster_id, [])
+
+        if len(neighbor_song_ids) <= 1:
+            print("No other songs found in the same L1 cluster.")
+            return
+
+        print(f"Found {len(neighbor_song_ids)} songs in L1 cluster '{l1_cluster_id}'. Calculating similarities...")
+
+        # Normalize the target vector once
+        target_vector_norm = target_vector / np.linalg.norm(target_vector)
+
+        similarities = []
+        for neighbor_id in neighbor_song_ids:
+            if neighbor_id == target_song_id:
+                continue
+            
+            neighbor_vector = self.song_vectors.get(neighbor_id)
+            if neighbor_vector is not None:
+                # Normalize neighbor vector and compute cosine similarity
+                neighbor_vector_norm = neighbor_vector / np.linalg.norm(neighbor_vector)
+                cosine_sim = np.dot(target_vector_norm, neighbor_vector_norm)
+                similarities.append((neighbor_id, cosine_sim))
+
+        # Sort by similarity in descending order
+        similarities.sort(key=lambda x: x[1], reverse=True)
+
+        print(f"\nTop {top_n} most similar neighbors in the same L1 cluster:")
+        for i, (song_id, sim) in enumerate(similarities[:top_n], 1):
+            info = self.song_info.get(song_id, {"name": "N/A", "singer": "N/A"})
+            sem_id = self.semantic_ids.get(song_id, "N/A")
+            print(f"  {i}. {info['name']} - {info['singer']} (Similarity: {sim:.4f}) (ID: {sem_id})")
+
+    def find_songs_by_semantic_id(self, id_prefix_str: str, max_display: int = 10):
+        """Finds and displays songs that match a given semantic ID prefix."""
+        try:
+            # Convert string like "10,55" to a tuple of integers
+            id_prefix = tuple(map(int, id_prefix_str.split(',')))
+        except ValueError:
+            print(f"Error: Invalid semantic ID format. Please use comma-separated integers, e.g., '10,55'.")
+            return
+
+        if not 1 <= len(id_prefix) <= 3:
+            print("Error: Please provide 1, 2, or 3 levels for the semantic ID.")
+            return
+
+        print(f"\nSearching for songs with semantic ID prefix: {id_prefix}...")
+        
+        matching_songs = []
+        # This is a linear scan, which is slow for large datasets but fine for this tool.
+        for song_id, sem_id in self.semantic_ids.items():
+            if sem_id[:len(id_prefix)] == id_prefix:
+                matching_songs.append(song_id)
+        
+        if not matching_songs:
+            print("No songs found matching this semantic ID prefix.")
+            return
+
+        print(f"Found {len(matching_songs)} songs. Showing up to {max_display}:")
+        for i, song_id in enumerate(matching_songs[:max_display], 1):
+            info = self.song_info.get(song_id, {"name": "N/A", "singer": "N/A"})
+            sem_id = self.semantic_ids.get(song_id, "N/A")
+            print(f"  {i}. {info['name']} - {info['singer']} (Full ID: {sem_id})")
+
+    def run_interactive(self):
+        """Starts the interactive command-line session."""
+        print("\n" + "="*50)
+        print("  🎶 语义ID质量交互式检验工具 🎶")
+        print("="*50)
+        print("  - 输入 歌曲ID (e.g., '12345') 来查找相似歌曲。")
+        print("  - 输入 语义ID (e.g., '10' or '10,55') 来查看该簇下的歌曲。")
+        print("  - 输入 'exit' 或 'quit' 即可退出。")
+        print("-"*50)
+
+        while True:
+            try:
+                prompt = input("\n请输入 song_id 或 semantic_id > ").strip()
+                if prompt.lower() in ['exit', 'quit']:
+                    break
+                if not prompt:
+                    continue
+                
+                # Simple dispatch logic
+                is_semantic_id_query = ',' in prompt or (prompt.isdigit() and len(prompt) < 4) # Heuristic
+
+                if is_semantic_id_query:
+                    self.find_songs_by_semantic_id(prompt)
+                else:
+                    self.find_neighbors(prompt)
+
+            except KeyboardInterrupt:
+                break
+        print("\n感谢使用，再见！")
+
+if __name__ == '__main__':
+    # Define paths to the necessary files
+    SEMANTIC_ID_FILE = "outputs/semantic_id/song_semantic_ids.jsonl"
+    SONG_VECTORS_FILE = "outputs/song_vectors.csv"
+    SONG_INFO_FILE = "data/gen_song_info.csv"
+
+    try:
+        evaluator = Evaluator(
+            semantic_id_path=SEMANTIC_ID_FILE,
+            vectors_path=SONG_VECTORS_FILE,
+            song_info_path=SONG_INFO_FILE
+        )
+        evaluator.run_interactive()
+    except Exception as e:
+        print(f"\nAn error occurred during initialization: {e}")
+        print("Please ensure all required files exist at the specified paths.")

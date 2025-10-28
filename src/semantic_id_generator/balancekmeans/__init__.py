@@ -237,7 +237,13 @@ class KMeans(object):
         :return: (np.array) initial state
         """
         num_samples = len(X)
-        indices = np.random.choice(num_samples, self.n_clusters, replace=False)
+        # If we need more centers than we have samples, sample with replacement.
+        # This can happen in recursive training on small data subsets.
+        if self.n_clusters > num_samples:
+            indices = np.random.choice(num_samples, self.n_clusters, replace=True)
+        else:
+            indices = np.random.choice(num_samples, self.n_clusters, replace=False)
+        
         initial_state = X[indices]
         return initial_state
     
