@@ -17,6 +17,14 @@ def auction_lap_half(job_and_worker_to_score, return_token_to_worker=True):
     Returns:
         - assignment -> balanced assignment between jobs and workers
     """
+    num_jobs, num_workers = job_and_worker_to_score.shape
+
+    # If there are fewer jobs than workers, a balanced assignment is ill-defined.
+    # Fall back to a simple, non-balanced assignment (each job to its best worker).
+    if num_jobs < num_workers:
+        # The caller expects an assignment for each job, where the value is the worker index.
+        return torch.argmin(job_and_worker_to_score, dim=1)
+
     # 转换输入为半精度
     job_and_worker_to_score = job_and_worker_to_score.half()
 
