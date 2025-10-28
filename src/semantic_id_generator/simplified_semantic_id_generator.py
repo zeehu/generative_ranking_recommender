@@ -232,7 +232,7 @@ class SimplifiedHierarchicalRQ:
             # --- Post-layer processing ---
             current_ids_np = cluster_ids.cpu().numpy()
             for i, song_id in enumerate(song_ids):
-                all_layer_ids[song_id].append(current_ids_np[i])
+                all_layer_ids[song_id].append(int(current_ids_np[i]))
             previous_level_ids = cluster_ids
 
             # --- Calculate residuals for the next layer (if not final layer) ---
