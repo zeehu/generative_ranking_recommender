@@ -3,7 +3,7 @@ Configuration file for the Generative Ranking Recommender project.
 """
 import os
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Dict
 
 @dataclass
 class DataConfig:
@@ -15,7 +15,8 @@ class DataConfig:
     
     # --- Paths for generated files (outputs of steps) ---
     song_vectors_file: str = "outputs/song_vectors.csv"
-    semantic_ids_file: str = "outputs/generator/song_semantic_ids.jsonl"
+    # Updated path for the new semantic ID generator
+    semantic_ids_file: str = "outputs/semantic_id/song_semantic_ids.jsonl"
 
 @dataclass
 class Word2VecConfig:
@@ -30,12 +31,27 @@ class Word2VecConfig:
     sample: float = 1e-5        # More aggressive subsampling for frequent words.
 
 @dataclass
-class SongRQKMeansConfig:
-    """Configuration for Song RQ-KMeans training."""
-    input_dim: int = 256      # Should match Word2Vec vector_size
-    vocab_size: int = 2048  # This is 'k' in k-means
-    levels: int = 2         # Number of residual levels
-    seed: int = 42
+class HierarchicalRQKMeansConfig:
+    """Configuration for the Hierarchical RQ-KMeans semantic ID generator."""
+    layer_clusters: List[int] = field(default_factory=list)
+    need_clusters: List[int] = field(default_factory=list)
+    embedding_dim: int = 256
+    iter_limit: int = 100
+
+# Pre-configured settings for different dataset sizes
+H_RQ_KMEANS_PROD = HierarchicalRQKMeansConfig(
+    layer_clusters=[128, 1280, 2560],
+    need_clusters=[128, 128, 256],
+    embedding_dim=256,
+    iter_limit=100
+)
+
+H_RQ_KMEANS_TEST = HierarchicalRQKMeansConfig(
+    layer_clusters=[32, 32, 64],
+    need_clusters=[32, 32, 8],
+    embedding_dim=256,
+    iter_limit=50
+)
 
 @dataclass
 class PlaylistTIGERConfig:
@@ -60,7 +76,9 @@ class Config:
     """Main configuration for the project."""
     data: DataConfig = field(default_factory=DataConfig)
     word2vec: Word2VecConfig = field(default_factory=Word2VecConfig)
-    rqkmeans: SongRQKMeansConfig = field(default_factory=SongRQKMeansConfig)
+    # Use the new hierarchical config
+    h_rqkmeans: HierarchicalRQKMeansConfig = field(default_factory=lambda: H_RQ_KMEANS_PROD)
+    h_rqkmeans_test: HierarchicalRQKMeansConfig = field(default_factory=lambda: H_RQ_KMEANS_TEST)
     generator_t5: PlaylistTIGERConfig = field(default_factory=PlaylistTIGERConfig)
     
     # Common paths
@@ -77,6 +95,8 @@ class Config:
         os.makedirs(self.output_dir, exist_ok=True)
         os.makedirs(os.path.join(self.output_dir, "generator"), exist_ok=True)
         os.makedirs(os.path.join(self.output_dir, "ranker"), exist_ok=True)
+        # Add new output directory for semantic_id module
+        os.makedirs(os.path.join(self.output_dir, "semantic_id"), exist_ok=True)
         os.makedirs(self.model_dir, exist_ok=True)
         os.makedirs(os.path.join(self.model_dir, "generator"), exist_ok=True)
         os.makedirs(os.path.join(self.model_dir, "ranker"), exist_ok=True)

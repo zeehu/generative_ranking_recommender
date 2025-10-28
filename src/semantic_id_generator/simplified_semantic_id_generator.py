@@ -1,4 +1,3 @@
-
 import torch
 import numpy as np
 import os
@@ -17,29 +16,15 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from src.semantic_id_generator.balancekmeans import KMeans, pairwise_distance_full
+from config import Config, H_RQ_KMEANS_PROD, H_RQ_KMEANS_TEST, HierarchicalRQKMeansConfig
 
-
-@dataclass
-class HierarchicalRQConfig:
-    """Configuration for SimplifiedHierarchicalRQ."""
-    # Number of clusters to train for each layer.
-    layer_clusters: List[int] = field(default_factory=lambda: [128, 1280, 2560])
-    # Number of clusters to actually use/select from each layer.
-    need_clusters: List[int] = field(default_factory=lambda: [128, 128, 256])
-    embedding_dim: int = 256
-    # K-means training iterations.
-    iter_limit: int = 100
-
-    def __post_init__(self):
-        assert len(self.need_clusters) == len(self.layer_clusters), "Length of need_clusters must match layer_clusters."
-        assert self.layer_clusters[0] == self.need_clusters[0], "First layer's 'layer_clusters' must equal 'need_clusters'."
 
 class SimplifiedHierarchicalRQ:
     """
     A simplified, object-oriented implementation of hierarchical residual quantization
     with balanced k-means and dynamic center selection.
     """
-    def __init__(self, config: HierarchicalRQConfig):
+    def __init__(self, config: HierarchicalRQKMeansConfig):
         self.config = config
         self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         
@@ -91,7 +76,10 @@ class SimplifiedHierarchicalRQ:
         return song_ids, tensor_embeddings.half() if use_half else tensor_embeddings.float()
 
     def _get_residuals(self, data: torch.Tensor, kmeans: KMeans) -> torch.Tensor:
-        """Calculates residuals after a k-means step."""
+        """
+        Calculates residuals after a k-means step.
+        Note: This is for layers where a single KMeans model is used.
+        """
         residuals = []
         batch_size = 100000 # Adjust based on GPU memory
         
@@ -108,7 +96,10 @@ class SimplifiedHierarchicalRQ:
         return torch.cat(residuals)
 
     def _train_middle_layer(self, data: torch.Tensor, prev_cluster_ids: torch.Tensor, layer_idx: int) -> (torch.Tensor, torch.Tensor):
-        """Trains a middle layer using the recursive approach from the original script."""
+        """
+        Trains a middle layer using the recursive approach from the original script.
+        This involves training a KMeans for each subgroup from the previous layer.
+        """
         print("Training middle layer with recursive approach...")
         n_clusters = self.config.layer_clusters[layer_idx]
         n_need = self.config.need_clusters[layer_idx]
@@ -120,16 +111,26 @@ class SimplifiedHierarchicalRQ:
         for i in tqdm(range(prev_n_need), desc=f"Sub-training Layer {layer_idx + 1}"):
             subgroup_indices = torch.where(prev_cluster_ids == i)[0]
             if len(subgroup_indices) == 0:
-                # This shouldn't happen with balanced k-means, but as a fallback...
+                # If a cluster from the previous layer is empty, append placeholder centers
+                # to maintain correct indexing for combined_centers.
+                placeholder_centers = torch.zeros(n_need, data.shape[1], device=self.device)
+                all_sub_centers.append(placeholder_centers)
                 continue
             
             sub_data = data[subgroup_indices].to(self.device)
 
-            # Here, we train n_clusters and then would ideally select n_need.
-            # The original logic was complex. A robust simplification is to train n_need directly.
-            sub_kmeans = KMeans(n_clusters=n_need, device=self.device, balanced=True)
-            sub_kmeans.fit(X=sub_data, iter_limit=self.config.iter_limit, half=use_half, tqdm_flag=False)
-            all_sub_centers.append(sub_kmeans.cluster_centers)
+            # If the number of samples is less than the clusters we need to find,
+            # running KMeans will fail. Instead, we sample from the small subgroup
+            # with replacement to generate the required number of centers.
+            if len(sub_data) < n_need:
+                sample_indices = np.random.choice(len(sub_data), n_need, replace=True)
+                sub_centers = sub_data[sample_indices]
+            else:
+                sub_kmeans = KMeans(n_clusters=n_need, device=self.device, balanced=True)
+                sub_kmeans.fit(X=sub_data, iter_limit=self.config.iter_limit, half=use_half, tqdm_flag=False)
+                sub_centers = sub_kmeans.cluster_centers
+
+            all_sub_centers.append(sub_centers)
 
         # Combine all the centers from the sub-models
         combined_centers = torch.cat(all_sub_centers).to(self.device)
@@ -215,7 +216,7 @@ class SimplifiedHierarchicalRQ:
                 kmeans_part2 = KMeans(n_clusters=n_clusters, device=self.device, balanced=True)
                 kmeans_part2.fit(X=current_data, iter_limit=20, half=use_half)
 
-                candidate_centers = torch.cat([kmeans_part1.cluster_centers, kmeans_part2.cluster_centers], dim=0)
+                candidate_centers = torch.cat([kmeans_part1.cluster_centers,kmeans_part2.cluster_centers], dim=0)
                 self.final_layer_centers = candidate_centers
                 self.trained_kmeans_models.append(None)
 
@@ -239,9 +240,6 @@ class SimplifiedHierarchicalRQ:
             if layer_idx == 0: # Only for the first layer, as others handle residuals internally
                 print("Calculating residuals for next layer...")
                 current_data = self._get_residuals(current_data, self.trained_kmeans_models[0])
-            
-        self.semantic_ids = all_layer_ids
-        print("Training complete.")
             
         self.semantic_ids = all_layer_ids
         print("Training complete.")
@@ -274,7 +272,7 @@ class SimplifiedHierarchicalRQ:
                     # Run a temporary KMeans on the subgroup to find its ideal centers
                     sub_data = data[subgroup_indices].to(self.device)
                     temp_kmeans = KMeans(n_clusters=n_need, device=self.device, balanced=True)
-                    temp_kmeans.fit(X=sub_data, iter_limit=20, tqdm_flag=False)
+                    temp_kmeans.fit(X=sub_data.to(self.device), iter_limit=20, tqdm_flag=False)
                     sub_centers = temp_kmeans.cluster_centers.cpu().numpy()
 
                 # Find the closest candidate centers for these ideal sub-centers
