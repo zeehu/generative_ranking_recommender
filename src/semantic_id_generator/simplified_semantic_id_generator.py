@@ -388,54 +388,45 @@ class SimplifiedHierarchicalRQ:
 if __name__ == '__main__':
     # This script is now an executable for a specific task.
     
-    # 1. Define input and output paths
-    input_csv_path = "outputs/song_vectors.csv"
-    output_dir = "outputs/semantic_id"
-    
     # --- FOR TESTING: Set a limit on the number of rows to load ---
     # --- Set to None to load all 1.8 million rows for a full run ---
     TEST_DATA_LIMIT = 10000  # Load only 10,000 songs for a quick test run
     # TEST_DATA_LIMIT = None # Uncomment this for a full production run
 
     print(f"--- Starting Semantic ID Generation ---")
-    print(f"Input file: {input_csv_path}")
-    print(f"Output directory: {output_dir}")
 
-    # Create output directory if it doesn't exist
-    os.makedirs(output_dir, exist_ok=True)
-
-    # 2. Initialize model with configuration optimized for the dataset size
     try:
+        # Instantiate the main Config object to get all configurations and file paths
+        main_config = Config()
+
+        # Determine which RQ-Kmeans configuration to use
         if TEST_DATA_LIMIT is not None:
             print(f"--- RUNNING IN TEST MODE (First {TEST_DATA_LIMIT} rows) ---")
-            # Use a smaller configuration suitable for 10k data to ensure fast execution
-            config_for_rq = HierarchicalRQKMeansConfig(
-                layer_clusters=[32, 32, 64],
-                need_clusters=[32, 32, 8],
-                embedding_dim=256,
-                iter_limit=50 # Reduced iterations for faster testing
-            )
+            rq_kmeans_config = main_config.h_rqkmeans_test
         else:
             print("--- RUNNING IN PRODUCTION MODE (Full Dataset) ---")
-            # Use the default configuration optimized for 1.8M data
-            config_for_rq = HierarchicalRQKMeansConfig(
-                layer_clusters=[128, 1280, 2560],
-                need_clusters=[128, 128, 256],
-                embedding_dim=256,
-                iter_limit=100
-            )
+            rq_kmeans_config = main_config.h_rqkmeans
 
-        # Instantiate the main Config object to get file paths
-        main_config = Config()
-        model = SimplifiedHierarchicalRQ(config_for_rq)
+        # Get file paths from the main config
+        input_csv_path = main_config.data.song_vectors_file
+        output_dir = os.path.join(main_config.output_dir, "semantic_id")
+        model_save_path = os.path.join(output_dir, "semantic_rq_model.pkl")
+        results_save_path = main_config.data.semantic_ids_file
+
+        print(f"Input file: {input_csv_path}")
+        print(f"Output directory: {output_dir}")
+        print(f"Semantic IDs will be saved to: {results_save_path}")
+
+        # Create output directory if it doesn't exist
+        os.makedirs(output_dir, exist_ok=True)
+
+        # 2. Initialize model with the chosen configuration
+        model = SimplifiedHierarchicalRQ(rq_kmeans_config)
 
         # 3. Train the model, passing the data limit for testing
         model.train(data_path=input_csv_path, data_limit=TEST_DATA_LIMIT)
 
-        # 4. Define save paths and save the model and results
-        model_save_path = osp.join(output_dir, "semantic_rq_model.pkl")
-        results_save_path = osp.join(output_dir, "song_semantic_ids.jsonl")
-        
+        # 4. Save the model and results
         model.save_model(model_save_path)
         model.save_semantic_ids(results_save_path)
 
@@ -445,7 +436,7 @@ if __name__ == '__main__':
 
     except FileNotFoundError as e:
         print(f"\nERROR: {e}")
-        print("Please ensure the input file exists and the path is correct.")
+        print("Please ensure all input files exist and paths are correct in config.py.")
     except ValueError as e:
         print(f"\nERROR: {e}")
         print("An error occurred during data processing. Please check the input file format and content.")
