@@ -406,9 +406,22 @@ if __name__ == '__main__':
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
 
-    # 2. Initialize model with configuration optimized for large-scale data
+    # 2. Initialize model with configuration optimized for the dataset size
     try:
-        config = HierarchicalRQConfig()
+        if TEST_DATA_LIMIT is not None:
+            print(f"--- RUNNING IN TEST MODE (First {TEST_DATA_LIMIT} rows) ---")
+            # Use a smaller configuration suitable for 10k data to ensure fast execution
+            config = HierarchicalRQConfig(
+                layer_clusters=[32, 32, 64],
+                need_clusters=[32, 32, 8],
+                embedding_dim=256,
+                iter_limit=50 # Reduced iterations for faster testing
+            )
+        else:
+            print("--- RUNNING IN PRODUCTION MODE (Full Dataset) ---")
+            # Use the default configuration optimized for 1.8M data
+            config = HierarchicalRQConfig()
+
         model = SimplifiedHierarchicalRQ(config)
 
         # 3. Train the model, passing the data limit for testing
