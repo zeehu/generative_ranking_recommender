@@ -31,6 +31,7 @@ def load_song_info(song_info_path: str) -> pd.DataFrame:
     logger.info(f"Loading song info from {song_info_path}...")
     try:
         df = pd.read_csv(song_info_path, sep='\t', header=None, names=['song_id', 'song_name', 'singer_name'])
+        df['song_id'] = df['song_id'].astype(str).str.strip() # Standardize song_id
         df.set_index('song_id', inplace=True)
         return df
     except FileNotFoundError:
@@ -81,6 +82,7 @@ def main(config: Config):
     try:
         vectors_df = pd.read_csv(data_config.song_vectors_file, header=None, dtype={0: str})
         vectors_df.rename(columns={0: 'song_id'}, inplace=True)
+        vectors_df['song_id'] = vectors_df['song_id'].str.strip() # Standardize song_id
         vectors_df.set_index('song_id', inplace=True)
     except FileNotFoundError:
         logger.error(f"FATAL: {data_config.song_vectors_file} not found. Run train_word2vec.py first.")

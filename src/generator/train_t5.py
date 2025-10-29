@@ -52,8 +52,16 @@ class T5Trainer:
     def run(self):
         logger.info("--- Starting Step G3: T5 Generator Model Training ---")
         model_config = self.config.generator_t5
+        rq_config = self.config.h_rqkmeans
+
+        # Calculate the number of custom semantic ID tokens
+        # This is the product of all need_clusters for the semantic ID levels
+        num_custom_tokens = np.prod(rq_config.need_clusters)
         
-        model = TIGERModel(base_model=model_config.model_name, vocab_size=self.config.rqkmeans.vocab_size)
+        # Initialize TIGERModel and TIGERTokenizer
+        # The vocab_size for TIGERModel should be the base tokenizer's vocab_size + num_custom_tokens
+        # TIGERModel's __init__ will handle adding these tokens and resizing the embedding layer.
+        model = TIGERModel(base_model=model_config.model_name, num_semantic_id_tokens=num_custom_tokens)
         model.model.config.use_cache = False # Necessary for gradient checkpointing
         tokenizer = model.tokenizer
 

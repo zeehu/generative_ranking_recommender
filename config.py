@@ -18,6 +18,11 @@ class DataConfig:
     # Updated path for the new semantic ID generator
     semantic_ids_file: str = "outputs/semantic_id/song_semantic_ids.jsonl"
 
+    # Data split ratios for training/validation/test
+    train_split_ratio: float = 0.98
+    val_split_ratio: float = 0.01
+    min_songs_per_playlist: int = 10 # Minimum number of songs required in a playlist after filtering by semantic ID availability
+
 @dataclass
 class Word2VecConfig:
     """Configuration for Word2Vec training."""
@@ -68,6 +73,14 @@ class PlaylistTIGERConfig:
     gradient_accumulation_steps: int = 1
     fp16: bool = True
     gradient_checkpointing_kwargs: dict = field(default_factory=lambda: {"use_reentrant": False})
+    # Number of custom semantic ID tokens to add to the tokenizer
+    num_semantic_id_tokens: int = 0 # This will be calculated dynamically
+
+    def __post_init__(self):
+        # Ensure num_semantic_id_tokens is set if h_rqkmeans is available
+        # This requires access to the main Config object, which is not available here.
+        # It will be set in train_t5.py based on h_rqkmeans.need_clusters.
+        pass
 
 # Note: Config for Ranker model will be added later.
 

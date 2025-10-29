@@ -86,11 +86,18 @@ class CorpusBuilder:
             # Per our "embrace collision" strategy, we do not de-duplicate songs or tokens here.
             sorted_songs = sorted(songs)
             semantic_tokens = []
+            songs_with_semantic_ids = 0 # Count songs that actually have semantic IDs
             for song_id in sorted_songs:
                 if song_id in semantic_id_map:
                     tokens = [f"<id_{sid}>" for sid in semantic_id_map[song_id]]
                     semantic_tokens.extend(tokens)
+                    songs_with_semantic_ids += 1
             
+            # Filter out playlists with too few songs after semantic ID filtering
+            if songs_with_semantic_ids < self.data_config.min_songs_per_playlist:
+                continue
+
+            # If no semantic tokens were found (e.g., all songs filtered out), skip
             if not semantic_tokens:
                 continue
 
@@ -107,9 +114,15 @@ class CorpusBuilder:
         random.shuffle(corpus)
         train_ratio = self.data_config.train_split_ratio
         val_ratio = self.data_config.val_split_ratio
-        train_end_idx = int(len(corpus) * train_ratio)
-        val_end_idx = train_end_idx + int(len(corpus) * val_ratio)
-        train_data, val_data, test_data = corpus[:train_end_idx], corpus[train_end_idx:val_end_idx], corpus[val_end_idx:]
+        
+        # Calculate split indices
+        total_len = len(corpus)
+        train_end_idx = int(total_len * train_ratio)
+        val_end_idx = train_end_idx + int(total_len * val_ratio)
+        
+        train_data = corpus[:train_end_idx]
+        val_data = corpus[train_end_idx:val_end_idx]
+        test_data = corpus[val_end_idx:] # Remaining data for test
 
         logger.info(f"Data split: {len(train_data)} train, {len(val_data)} validation, {len(test_data)} test.")
         output_dir = os.path.join(self.config.output_dir, "generator")
