@@ -4,7 +4,6 @@ Interactive script to evaluate the quality of generated semantic IDs.
 This tool allows you to pick a song and find its nearest neighbors within the
 same semantic cluster (at the first level), ranked by cosine similarity of their
 original vectors. This provides a qualitative measure of the clustering quality.
-It also provides quantitative metrics (Silhouette, CH, DB scores).
 """
 import os
 import sys
@@ -14,7 +13,6 @@ import numpy as np
 import torch
 from tqdm import tqdm
 from collections import defaultdict
-from sklearn.metrics import silhouette_score, calinski_harabasz_score, davies_bouldin_score
 
 # Add project root to sys.path to allow for absolute imports
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
@@ -162,75 +160,6 @@ class Evaluator:
             sem_id = self.semantic_ids.get(song_id, "N/A")
             print(f"  {i}. {info['name']} - {info['singer']} (Full ID: {sem_id})")
 
-    def calculate_clustering_metrics(self, sample_size: int = 50000):
-        """Calculates and prints clustering evaluation metrics (Silhouette, CH, DB)."""
-        print("\n" + "="*80)
-        print("  Calculating Clustering Metrics (Silhouette, CH, DB)")
-        print("="*80)
-
-        # Filter for songs that have both vector and semantic ID
-        valid_song_ids = [sid for sid in self.song_vectors.keys() if sid in self.semantic_ids]
-        
-        if not valid_song_ids:
-            print("No valid songs with both vectors and semantic IDs found for metric calculation.")
-            return
-
-        # --- Unified Sampling for all metrics ---
-        # If the dataset is larger than sample_size, we sample to reduce computation.
-        if len(valid_song_ids) > sample_size:
-            print(f"Sampling {sample_size} points for all metric calculations (full dataset is too large)...")
-            # Randomly sample indices
-            indices = np.random.choice(len(valid_song_ids), sample_size, replace=False)
-            sampled_song_ids = [valid_song_ids[i] for i in indices]
-        else:
-            sampled_song_ids = valid_song_ids
-        
-        # Prepare data: X (vectors), labels (full semantic ID as string) from the sampled IDs
-        X_sample_list = []
-        labels_sample_list = []
-
-        print(f"Collecting {len(sampled_song_ids)} data points for metrics...")
-        for song_id in tqdm(sampled_song_ids, desc="Collecting data for metrics"):
-            X_sample_list.append(self.song_vectors[song_id])
-            labels_sample_list.append(str(self.semantic_ids[song_id])) # Convert tuple to string for label
-
-        X_sample = np.array(X_sample_list)
-        labels_sample = np.array(labels_sample_list)
-        
-        unique_labels_sample = np.unique(labels_sample)
-
-        # Ensure there's more than one cluster in the sample
-        if len(unique_labels_sample) <= 1:
-            print("Only one unique semantic ID found in the sample. Cannot calculate clustering metrics.")
-            return
-        
-        # --- Calculate Calinski-Harabasz Index --- (Higher is better)
-        # Requires at least 2 clusters and n_samples > n_clusters
-        if len(X_sample) > len(unique_labels_sample) and len(unique_labels_sample) > 1:
-            ch_score = calinski_harabasz_score(X_sample, labels_sample)
-            print(f"Calinski-Harabasz Index: {ch_score:.4f} (Higher is better)")
-        else:
-            print("Not enough samples relative to unique IDs in sample for Calinski-Harabasz Index.")
-
-        # --- Calculate Davies-Bouldin Index --- (Lower is better)
-        # Requires at least 2 clusters
-        if len(unique_labels_sample) > 1:
-            db_score = davies_bouldin_score(X_sample, labels_sample)
-            print(f"Davies-Bouldin Index: {db_score:.4f} (Lower is better)")
-        else:
-            print("Not enough unique IDs in sample for Davies-Bouldin Index.")
-
-        # --- Calculate Silhouette Score --- (Higher is better)
-        # Requires at least 2 clusters and n_samples > 1
-        if len(unique_labels_sample) > 1 and len(X_sample) > 1:
-            print(f"Calculating Silhouette Score on {len(X_sample)} samples...")
-            silhouette_avg = silhouette_score(X_sample, labels_sample)
-            print(f"Silhouette Score: {silhouette_avg:.4f} (Higher is better)")
-        else:
-            print("Not enough samples or unique IDs in sample for Silhouette Score.")
-        
-        print("="*80)
-
     def run_interactive(self):
         """Starts the interactive command-line session."""
         print("\n" + "="*50)
@@ -238,7 +167,6 @@ class Evaluator:
         print("="*50)
         print("  - 输入 歌曲ID (e.g., '12345') 来查找相似歌曲。")
         print("  - 输入 语义ID (e.g., '10' 或 '10,55') 来查看该簇下的歌曲。")
-        print("  - 输入 'metrics' 来计算聚类评估指标。")
         print("  - 输入 'exit' 或 'quit' 即可退出。")
         print("-"*50)
 
@@ -250,16 +178,13 @@ class Evaluator:
                 if not prompt:
                     continue
                 
-                if prompt.lower() == 'metrics':
-                    self.calculate_clustering_metrics()
-                else:
-                    # Simple dispatch logic
-                    is_semantic_id_query = ',' in prompt or (prompt.isdigit() and len(prompt) < 4) # Heuristic
+                # Simple dispatch logic
+                is_semantic_id_query = ',' in prompt or (prompt.isdigit() and len(prompt) < 4) # Heuristic
 
-                    if is_semantic_id_query:
-                        self.find_songs_by_semantic_id(prompt)
-                    else:
-                        self.find_neighbors(prompt)
+                if is_semantic_id_query:
+                    self.find_songs_by_semantic_id(prompt)
+                else:
+                    self.find_neighbors(prompt)
 
             except KeyboardInterrupt:
                 break
