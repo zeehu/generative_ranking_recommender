@@ -76,13 +76,17 @@ generative_ranking_recommender/
     *   **输出**: `outputs/semantic_id/song_semantic_ids.jsonl` (JSONL格式)。
     *   **配置**: 训练参数（如聚类层数、每层聚类数、迭代次数等）在 `config.py` 的 `HierarchicalRQKMeansConfig` 中定义，并根据 `TEST_DATA_LIMIT` 自动切换生产/测试配置。
 
-2.  **G1b - 评估语义ID质量**:
+2.  **G1b - 交互式评估语义ID质量**:
     *   **命令**: `python src/semantic_id_generator/evaluate_semantic_ids.py`
-    *   **作用**: 提供一个交互式工具，用于定性（查找相似歌曲/语义ID下的歌曲）和定量（Silhouette, CH, DB 指标）评估生成的语义ID质量。
+    *   **作用**: 提供一个交互式工具，用于定性评估生成的语义ID质量。您可以输入歌曲ID查找相似歌曲，或输入语义ID查找该簇下的歌曲。
 
 3.  **G1c - 检查语义ID冲突**:
     *   **命令**: `python src/semantic_id_generator/debug_collisions.py`
     *   **作用**: 检查 `song_semantic_ids.jsonl` 文件中是否存在不同歌曲被分配到相同语义ID的冲突情况，并生成报告。
+
+4.  **G1d - 批量计算语义ID评估指标**:
+    *   **命令**: `python src/semantic_id_generator/calculate_metrics.py`
+    *   **作用**: 专门用于批量计算生成的语义ID的定量评估指标（如轮廓系数、CH指数、DB指数）。该脚本会进行数据抽样以优化内存和计算效率。
 
 ### **第二部分：【引擎一】T5生成模型 (用于候选生成)**
 
