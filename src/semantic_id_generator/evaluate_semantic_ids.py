@@ -168,63 +168,64 @@ class Evaluator:
         print("  Calculating Clustering Metrics (Silhouette, CH, DB)")
         print("="*80)
 
-        # Prepare data: X (vectors), labels (full semantic ID as string)
-        X_all = []
-        labels_all = []
-        song_ids_with_vectors = list(self.song_vectors.keys())
-
         # Filter for songs that have both vector and semantic ID
-        valid_song_ids = [sid for sid in song_ids_with_vectors if sid in self.semantic_ids]
+        valid_song_ids = [sid for sid in self.song_vectors.keys() if sid in self.semantic_ids]
         
         if not valid_song_ids:
             print("No valid songs with both vectors and semantic IDs found for metric calculation.")
             return
 
-        print(f"Preparing {len(valid_song_ids)} data points for metric calculation...")
-        for song_id in tqdm(valid_song_ids, desc="Collecting data for metrics"):
-            X_all.append(self.song_vectors[song_id])
-            labels_all.append(str(self.semantic_ids[song_id])) # Convert tuple to string for label
+        # --- Unified Sampling for all metrics ---
+        # If the dataset is larger than sample_size, we sample to reduce computation.
+        if len(valid_song_ids) > sample_size:
+            print(f"Sampling {sample_size} points for all metric calculations (full dataset is too large)...")
+            # Randomly sample indices
+            indices = np.random.choice(len(valid_song_ids), sample_size, replace=False)
+            sampled_song_ids = [valid_song_ids[i] for i in indices]
+        else:
+            sampled_song_ids = valid_song_ids
+        
+        # Prepare data: X (vectors), labels (full semantic ID as string) from the sampled IDs
+        X_sample_list = []
+        labels_sample_list = []
 
-        X_all = np.array(X_all)
-        labels_all = np.array(labels_all)
+        print(f"Collecting {len(sampled_song_ids)} data points for metrics...")
+        for song_id in tqdm(sampled_song_ids, desc="Collecting data for metrics"):
+            X_sample_list.append(self.song_vectors[song_id])
+            labels_sample_list.append(str(self.semantic_ids[song_id])) # Convert tuple to string for label
 
-        # Ensure there's more than one cluster
-        if len(np.unique(labels_all)) <= 1:
-            print("Only one unique semantic ID found. Cannot calculate clustering metrics.")
+        X_sample = np.array(X_sample_list)
+        labels_sample = np.array(labels_sample_list)
+        
+        unique_labels_sample = np.unique(labels_sample)
+
+        # Ensure there's more than one cluster in the sample
+        if len(unique_labels_sample) <= 1:
+            print("Only one unique semantic ID found in the sample. Cannot calculate clustering metrics.")
             return
         
         # --- Calculate Calinski-Harabasz Index --- (Higher is better)
         # Requires at least 2 clusters and n_samples > n_clusters
-        if len(valid_song_ids) > len(np.unique(labels_all)) and len(np.unique(labels_all)) > 1:
-            ch_score = calinski_harabasz_score(X_all, labels_all)
+        if len(X_sample) > len(unique_labels_sample) and len(unique_labels_sample) > 1:
+            ch_score = calinski_harabasz_score(X_sample, labels_sample)
             print(f"Calinski-Harabasz Index: {ch_score:.4f} (Higher is better)")
         else:
-            print("Not enough samples relative to unique IDs for Calinski-Harabasz Index.")
+            print("Not enough samples relative to unique IDs in sample for Calinski-Harabasz Index.")
 
         # --- Calculate Davies-Bouldin Index --- (Lower is better)
         # Requires at least 2 clusters
-        if len(np.unique(labels_all)) > 1:
-            db_score = davies_bouldin_score(X_all, labels_all)
+        if len(unique_labels_sample) > 1:
+            db_score = davies_bouldin_score(X_sample, labels_sample)
             print(f"Davies-Bouldin Index: {db_score:.4f} (Lower is better)")
         else:
-            print("Not enough unique IDs for Davies-Bouldin Index.")
+            print("Not enough unique IDs in sample for Davies-Bouldin Index.")
 
-        # --- Calculate Silhouette Score (with sampling for large datasets) --- (Higher is better)
+        # --- Calculate Silhouette Score --- (Higher is better)
         # Requires at least 2 clusters and n_samples > 1
-        if len(valid_song_ids) > sample_size:
-            print(f"Sampling {sample_size} points for Silhouette Score calculation (full dataset is too large)...")
-            # Randomly sample indices
-            indices = np.random.choice(len(valid_song_ids), sample_size, replace=False)
-            X_sample = X_all[indices]
-            labels_sample = labels_all[indices]
-        else:
-            X_sample = X_all
-            labels_sample = labels_all
-        
-        if len(np.unique(labels_sample)) > 1 and len(X_sample) > 1:
+        if len(unique_labels_sample) > 1 and len(X_sample) > 1:
             print(f"Calculating Silhouette Score on {len(X_sample)} samples...")
             silhouette_avg = silhouette_score(X_sample, labels_sample)
-            print(f"Silhouette Score (sampled): {silhouette_avg:.4f} (Higher is better)")
+            print(f"Silhouette Score: {silhouette_avg:.4f} (Higher is better)")
         else:
             print("Not enough samples or unique IDs in sample for Silhouette Score.")
         
