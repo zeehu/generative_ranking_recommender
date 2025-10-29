@@ -4,6 +4,7 @@ Interactive script to evaluate the quality of generated semantic IDs.
 This tool allows you to pick a song and find its nearest neighbors within the
 same semantic cluster (at the first level), ranked by cosine similarity of their
 original vectors. This provides a qualitative measure of the clustering quality.
+It also provides quantitative metrics (Silhouette, CH, DB scores).
 """
 import os
 import sys
@@ -13,21 +14,25 @@ import numpy as np
 import torch
 from tqdm import tqdm
 from collections import defaultdict
+from sklearn.metrics import silhouette_score, calinski_harabasz_score, davies_bouldin_score
 
 # Add project root to sys.path to allow for absolute imports
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
+from config import Config
+
 class Evaluator:
-    def __init__(self, semantic_id_path, vectors_path, song_info_path):
+    def __init__(self, config: Config):
         print("--- Semantic ID Quality Evaluator ---")
-        self.song_info = self._load_song_info(song_info_path)
-        self.song_vectors = self._load_song_vectors(vectors_path)
-        self.semantic_ids, self.l1_clusters = self._load_semantic_ids(semantic_id_path)
+        self.config = config
+        self.song_info = self._load_song_info(config.data.song_info_file)
+        self.song_vectors = self._load_song_vectors(config.data.song_vectors_file)
+        self.semantic_ids, self.l1_clusters = self._load_semantic_ids(config.data.semantic_ids_file)
 
         if not self.song_info or not self.song_vectors or not self.semantic_ids:
-            raise RuntimeError("Failed to load necessary files. Please check paths.")
+            raise RuntimeError("Failed to load necessary files. Please check paths in config.py.")
 
         print("\nInitialization complete. Evaluator is ready.")
 
@@ -157,49 +162,115 @@ class Evaluator:
             sem_id = self.semantic_ids.get(song_id, "N/A")
             print(f"  {i}. {info['name']} - {info['singer']} (Full ID: {sem_id})")
 
+    def calculate_clustering_metrics(self, sample_size: int = 50000):
+        """Calculates and prints clustering evaluation metrics (Silhouette, CH, DB)."""
+        print("\n" + "="*80)
+        print("  Calculating Clustering Metrics (Silhouette, CH, DB)")
+        print("="*80)
+
+        # Prepare data: X (vectors), labels (full semantic ID as string)
+        X_all = []
+        labels_all = []
+        song_ids_with_vectors = list(self.song_vectors.keys())
+
+        # Filter for songs that have both vector and semantic ID
+        valid_song_ids = [sid for sid in song_ids_with_vectors if sid in self.semantic_ids]
+        
+        if not valid_song_ids:
+            print("No valid songs with both vectors and semantic IDs found for metric calculation.")
+            return
+
+        print(f"Preparing {len(valid_song_ids)} data points for metric calculation...")
+        for song_id in tqdm(valid_song_ids, desc="Collecting data for metrics"):
+            X_all.append(self.song_vectors[song_id])
+            labels_all.append(str(self.semantic_ids[song_id])) # Convert tuple to string for label
+
+        X_all = np.array(X_all)
+        labels_all = np.array(labels_all)
+
+        # Ensure there's more than one cluster
+        if len(np.unique(labels_all)) <= 1:
+            print("Only one unique semantic ID found. Cannot calculate clustering metrics.")
+            return
+        
+        # --- Calculate Calinski-Harabasz Index --- (Higher is better)
+        # Requires at least 2 clusters and n_samples > n_clusters
+        if len(valid_song_ids) > len(np.unique(labels_all)) and len(np.unique(labels_all)) > 1:
+            ch_score = calinski_harabasz_score(X_all, labels_all)
+            print(f"Calinski-Harabasz Index: {ch_score:.4f} (Higher is better)")
+        else:
+            print("Not enough samples relative to unique IDs for Calinski-Harabasz Index.")
+
+        # --- Calculate Davies-Bouldin Index --- (Lower is better)
+        # Requires at least 2 clusters
+        if len(np.unique(labels_all)) > 1:
+            db_score = davies_bouldin_score(X_all, labels_all)
+            print(f"Davies-Bouldin Index: {db_score:.4f} (Lower is better)")
+        else:
+            print("Not enough unique IDs for Davies-Bouldin Index.")
+
+        # --- Calculate Silhouette Score (with sampling for large datasets) --- (Higher is better)
+        # Requires at least 2 clusters and n_samples > 1
+        if len(valid_song_ids) > sample_size:
+            print(f"Sampling {sample_size} points for Silhouette Score calculation (full dataset is too large)...")
+            # Randomly sample indices
+            indices = np.random.choice(len(valid_song_ids), sample_size, replace=False)
+            X_sample = X_all[indices]
+            labels_sample = labels_all[indices]
+        else:
+            X_sample = X_all
+            labels_sample = labels_all
+        
+        if len(np.unique(labels_sample)) > 1 and len(X_sample) > 1:
+            print(f"Calculating Silhouette Score on {len(X_sample)} samples...")
+            silhouette_avg = silhouette_score(X_sample, labels_sample)
+            print(f"Silhouette Score (sampled): {silhouette_avg:.4f} (Higher is better)")
+        else:
+            print("Not enough samples or unique IDs in sample for Silhouette Score.")
+        
+        print("="*80)
+
     def run_interactive(self):
         """Starts the interactive command-line session."""
         print("\n" + "="*50)
         print("  🎶 语义ID质量交互式检验工具 🎶")
         print("="*50)
         print("  - 输入 歌曲ID (e.g., '12345') 来查找相似歌曲。")
-        print("  - 输入 语义ID (e.g., '10' or '10,55') 来查看该簇下的歌曲。")
+        print("  - 输入 语义ID (e.g., '10' 或 '10,55') 来查看该簇下的歌曲。")
+        print("  - 输入 'metrics' 来计算聚类评估指标。")
         print("  - 输入 'exit' 或 'quit' 即可退出。")
         print("-"*50)
 
         while True:
             try:
-                prompt = input("\n请输入 song_id 或 semantic_id > ").strip()
+                prompt = input("\n请输入 song_id, semantic_id, 或 'metrics' > ").strip()
                 if prompt.lower() in ['exit', 'quit']:
                     break
                 if not prompt:
                     continue
                 
-                # Simple dispatch logic
-                is_semantic_id_query = ',' in prompt or (prompt.isdigit() and len(prompt) < 4) # Heuristic
-
-                if is_semantic_id_query:
-                    self.find_songs_by_semantic_id(prompt)
+                if prompt.lower() == 'metrics':
+                    self.calculate_clustering_metrics()
                 else:
-                    self.find_neighbors(prompt)
+                    # Simple dispatch logic
+                    is_semantic_id_query = ',' in prompt or (prompt.isdigit() and len(prompt) < 4) # Heuristic
+
+                    if is_semantic_id_query:
+                        self.find_songs_by_semantic_id(prompt)
+                    else:
+                        self.find_neighbors(prompt)
 
             except KeyboardInterrupt:
                 break
         print("\n感谢使用，再见！")
 
 if __name__ == '__main__':
-    # Define paths to the necessary files
-    SEMANTIC_ID_FILE = "outputs/semantic_id/song_semantic_ids.jsonl"
-    SONG_VECTORS_FILE = "outputs/song_vectors.csv"
-    SONG_INFO_FILE = "data/gen_song_info.csv"
-
     try:
-        evaluator = Evaluator(
-            semantic_id_path=SEMANTIC_ID_FILE,
-            vectors_path=SONG_VECTORS_FILE,
-            song_info_path=SONG_INFO_FILE
-        )
+        # Instantiate the main Config object to get all configurations and file paths
+        main_config = Config()
+
+        evaluator = Evaluator(config=main_config)
         evaluator.run_interactive()
     except Exception as e:
         print(f"\nAn error occurred during initialization: {e}")
-        print("Please ensure all required files exist at the specified paths.")
+        print("Please ensure all required files exist at the specified paths in config.py.")
