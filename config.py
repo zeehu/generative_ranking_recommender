@@ -1,9 +1,12 @@
 """
-Configuration file for the Generative Ranking Recommender project.
+Configuration file for the Generative Ranking Recommender project.     
 """
 import os
 from dataclasses import dataclass, field
 from typing import List, Dict
+
+# 导入HierarchicalRQKMeansConfig
+from src.semantic_id_generator.hierarchical_rq_kmeans import HierarchicalRQKMeansConfig
 
 @dataclass
 class DataConfig:
@@ -14,7 +17,7 @@ class DataConfig:
     song_info_file: str = "data/gen_song_info.csv"
     
     # --- Paths for generated files (outputs of steps) ---
-    song_vectors_file: str = "outputs/song_vectors.csv"
+    song_vectors_file: str = "outputs/sg1_vs512_w50_ep20_song_vectors.csv"
     # Updated path for the new semantic ID generator
     semantic_ids_file: str = "outputs/semantic_id/song_semantic_ids.jsonl"
 
@@ -28,45 +31,41 @@ class Word2VecConfig:
     """Configuration for Word2Vec training."""
     corpus_file: str = "outputs/playlists_corpus.txt" # Path to the preprocessed corpus
     corpus_ids_file: str = "outputs/playlists_corpus.ids.txt" # Path to the corresponding playlist IDs
-    vector_size: int = 256      # Dimensionality of the song vectors.
-    window: int = 100           # Context window size.
-    min_count: int = 5          # Ignores all songs with total frequency lower than this.
-    workers: int = -1           # Use all available CPU cores, -1 means all.
-    epochs: int = 10             # Increased epochs for better quality.
+    vector_size: int = 512      # Dimensionality of the song vectors.
+    window: int = 50           # Context window size.
+    min_count: int = 10          # Ignores all songs with total frequency lower than this.
+    workers: int = 20           # Use all available CPU cores, -1 means all.
+    epochs: int = 20             # Increased epochs for better quality.
     sample: float = 1e-5        # More aggressive subsampling for frequent words.
-
-@dataclass
-class HierarchicalRQKMeansConfig:
-    """Configuration for the Hierarchical RQ-KMeans semantic ID generator."""
-    layer_clusters: List[int] = field(default_factory=list)
-    need_clusters: List[int] = field(default_factory=list)
-    embedding_dim: int = 256
-    iter_limit: int = 100
 
 # Pre-configured settings for different dataset sizes
 H_RQ_KMEANS_PROD = HierarchicalRQKMeansConfig(
-    layer_clusters=[128, 1280, 2560],
-    need_clusters=[128, 128, 256],
-    embedding_dim=256,
+    layer_clusters=[128, 1280, 1280],
+    need_clusters=[128, 128, 128],
+    embedding_dim=512,
+    group_dims=[512],  # 如果没有特殊分组，使用单个维度
+    hierarchical_weights=[[1.0], [1.0], [1.0]],  # 如果没有特殊权重，使用均匀权重
     iter_limit=100
 )
 
 H_RQ_KMEANS_TEST = HierarchicalRQKMeansConfig(
-    layer_clusters=[32, 32, 64],
-    need_clusters=[32, 32, 8],
-    embedding_dim=256,
+    layer_clusters=[32, 128, 128],  # 第2层改为128，使其不等于need_clusters[1]=32，触发递归聚类策略
+    need_clusters=[32, 32, 32],
+    embedding_dim=512,
+    group_dims=[512],  # 如果没有特殊分组，使用单个维度
+    hierarchical_weights=[[1.0], [1.0], [1.0]],  # 如果没有特殊权重，使用均匀权重
     iter_limit=50
 )
 
 @dataclass
 class PlaylistTIGERConfig:
     """Configuration for the T5 Generator model."""
-    model_name: str = "/home/search/base_model/menzi-t5-base" # Local path for offline env
+    model_name: str = "/home/search/base-model/mengzi-t5-base" # Local path for offline env
     max_input_length: int = 128
-    max_target_length: int = 256
+    max_target_length: int = 512
     num_train_epochs: int = 5
-    per_device_train_batch_size: int = 192
-    per_device_eval_batch_size: int = 8
+    per_device_train_batch_size: int = 256
+    per_device_eval_batch_size: int = 256
     learning_rate: float = 5e-4
     warmup_steps: int = 500
     weight_decay: float = 0.01
@@ -102,7 +101,7 @@ class Config:
     # System settings
     device: str = "cuda"
     seed: int = 42
-    num_workers: int = 2
+    num_workers: int = 8
     
     def __post_init__(self):
         os.makedirs(self.output_dir, exist_ok=True)

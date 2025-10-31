@@ -14,6 +14,7 @@ venv/
 /models/
 /outputs/
 /logs/
+/BalanceRqKMeans/
 
 # OS-specific
 .DS_Store

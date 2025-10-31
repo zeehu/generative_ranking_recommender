@@ -1,5 +1,5 @@
 """
-Step G2: Generate Training Corpus for the T5 Generator Model.
+Step G2: Generate Training Corpus for the T5 Generator Model.  
 
 This script reads the raw playlist data, combines it with the generated
 semantic IDs (song-to-cluster map), and produces train/val/test splits
@@ -16,7 +16,7 @@ import random
 # Add project root to sys.path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if project_root not in sys.path:
-sys.path.insert(0, project_root)
+    sys.path.insert(0, project_root)
 
 from config import Config
 from src.common.utils import setup_logging
@@ -54,7 +54,7 @@ class CorpusBuilder:
     def _load_playlist_info(self) -> dict:
         logger.info(f"Loading playlist info from {self.data_config.playlist_info_file}...")
         try:
-            df = pd.read_csv(self.data_config.playlist_info_file, sep='\t', header=None, names=['glid', 'listname', 'tag_list'])
+            df = pd.read_csv(self.data_config.playlist_info_file, sep='\t')
             df.set_index('glid', inplace=True)
             return df.to_dict('index')
         except FileNotFoundError:
@@ -64,8 +64,7 @@ class CorpusBuilder:
     def _load_playlist_songs(self) -> dict:
         logger.info(f"Loading playlist songs from {self.data_config.playlist_songs_file}...")
         try:
-            df = pd.read_csv(self.data_config.playlist_songs_file, dtype=str)
-            df.columns = ['playlist_id', 'song_id']
+            df = pd.read_csv(self.data_config.playlist_songs_file, sep='\t', header=None, names=['playlist_id', 'song_id'], dtype=str)
             grouped = df.groupby('playlist_id')['song_id'].apply(list)
             return grouped.to_dict()
         except FileNotFoundError:
@@ -73,6 +72,13 @@ class CorpusBuilder:
             sys.exit(1)
 
     def _build_corpus(self, playlist_info: dict, playlist_songs: dict, semantic_id_map: dict) -> list:
+        """
+        Build text-to-text corpus with layer-specific semantic ID tokens.
+        
+        Each semantic ID is represented as <id_l{layer}_{id}> to distinguish
+        which layer the ID belongs to. This allows the T5 model to learn
+        multi-granular semantic information from the three-layer hierarchical IDs.
+        """
         logger.info("Building text-to-text corpus...")
         corpus = []
         for glid, songs in tqdm(playlist_songs.items(), desc="Processing playlists"):
@@ -89,7 +95,14 @@ class CorpusBuilder:
             songs_with_semantic_ids = 0 # Count songs that actually have semantic IDs
             for song_id in sorted_songs:
                 if song_id in semantic_id_map:
-                    tokens = [f"<id_{sid}>" for sid in semantic_id_map[song_id]]
+                    # Create layer-specific tokens for each of the three layers
+                    # semantic_ids = [layer1_id, layer2_id, layer3_id]
+                    semantic_ids = semantic_id_map[song_id]
+                    tokens = [
+                        f"<id_l1_{semantic_ids[0]}>",  # Layer 1 token
+                        f"<id_l2_{semantic_ids[1]}>",  # Layer 2 token
+                        f"<id_l3_{semantic_ids[2]}>",  # Layer 3 token
+                    ]
                     semantic_tokens.extend(tokens)
                     songs_with_semantic_ids += 1
             

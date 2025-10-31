@@ -1,10 +1,11 @@
 """
-Step G3: Train the T5 Generator Model.
+Step G3: Train the T5 Generator Model. 
 """
 import os
 import sys
 import logging
 import torch
+import numpy as np
 from torch.utils.data import Dataset
 from transformers import Trainer, TrainingArguments, DataCollatorForSeq2Seq
 
@@ -54,19 +55,40 @@ class T5Trainer:
         model_config = self.config.generator_t5
         rq_config = self.config.h_rqkmeans
 
-        # Calculate the number of custom semantic ID tokens
-        # This is the product of all need_clusters for the semantic ID levels
-        num_custom_tokens = np.prod(rq_config.need_clusters)
+        # Calculate the layer-specific vocab sizes for semantic ID tokens
+        # need_clusters = [128, 128, 128] means:
+        #   Layer 1: 128 different IDs (0-127)
+        #   Layer 2: 128 different IDs (0-127)
+        #   Layer 3: 128 different IDs (0-127)
+        layer_vocab_sizes = {
+            'l1': rq_config.need_clusters[0],
+            'l2': rq_config.need_clusters[1],
+            'l3': rq_config.need_clusters[2],
+        }
+        
+        logger.info(f"Layer vocab sizes: {layer_vocab_sizes}")
+        logger.info(f"Total semantic ID tokens: {sum(layer_vocab_sizes.values())} + 2 special tokens")
         
         # Initialize TIGERModel and TIGERTokenizer
-        # The vocab_size for TIGERModel should be the base tokenizer's vocab_size + num_custom_tokens
-        # TIGERModel's __init__ will handle adding these tokens and resizing the embedding layer.
-        model = TIGERModel(base_model=model_config.model_name, num_semantic_id_tokens=num_custom_tokens)
-        model.model.config.use_cache = False # Necessary for gradient checkpointing
+        # The model will add layer-specific semantic ID tokens to the tokenizer
+        model = TIGERModel(base_model=model_config.model_name, layer_vocab_sizes=layer_vocab_sizes)
+        model.model.config.use_cache = False  # Necessary for gradient checkpointing
         tokenizer = model.tokenizer
+        
+        logger.info(f"Tokenizer vocab size: {len(tokenizer)}")
 
-        train_dataset = PlaylistDataset(os.path.join(self.config.output_dir, "generator", "train.tsv"), tokenizer, model_config.max_input_length, model_config.max_target_length)
-        val_dataset = PlaylistDataset(os.path.join(self.config.output_dir, "generator", "val.tsv"), tokenizer, model_config.max_input_length, model_config.max_target_length)
+        train_dataset = PlaylistDataset(
+            os.path.join(self.config.output_dir, "generator", "train.tsv"), 
+            tokenizer, 
+            model_config.max_input_length, 
+            model_config.max_target_length
+        )
+        val_dataset = PlaylistDataset(
+            os.path.join(self.config.output_dir, "generator", "val.tsv"), 
+            tokenizer, 
+            model_config.max_input_length, 
+            model_config.max_target_length
+        )
 
         training_args = TrainingArguments(
             output_dir=os.path.join(self.config.model_dir, "generator", "checkpoints"),
@@ -81,9 +103,9 @@ class T5Trainer:
             gradient_checkpointing_kwargs=model_config.gradient_checkpointing_kwargs,
             max_grad_norm=1.0,
             eval_strategy="steps",
-            eval_steps=1000,
+            eval_steps=2000,
             save_strategy="steps",
-            save_steps=1000,
+            save_steps=2000,
             save_total_limit=2,
             load_best_model_at_end=True,
             metric_for_best_model="eval_loss",
