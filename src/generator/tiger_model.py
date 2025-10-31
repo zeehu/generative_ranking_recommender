@@ -64,20 +64,34 @@ class TIGERTokenizer:
 
     @classmethod
     def from_pretrained(cls, load_directory: str):
+        # Load custom config first to get layer_vocab_sizes
+        custom_config_path = os.path.join(load_directory, 'custom_tokenizer_config.json')
+        if not os.path.exists(custom_config_path):
+            raise FileNotFoundError(
+                f"Custom tokenizer config not found at {custom_config_path}. "
+                "Make sure the model was saved with TIGERTokenizer.save_pretrained()"
+            )
+        
+        with open(custom_config_path, 'r') as f:
+            config = json.load(f)
+        
+        # Load base tokenizer
         base_tokenizer = T5Tokenizer.from_pretrained(load_directory)
+        
+        # Verify vocab size matches
+        if len(base_tokenizer) != config['custom_vocab_size']:
+            raise ValueError(
+                f"Vocab size mismatch: loaded tokenizer has {len(base_tokenizer)} tokens, "
+                f"but config expects {config['custom_vocab_size']} tokens"
+            )
+        
+        # Create tokenizer instance without calling __init__
         tokenizer = cls.__new__(cls)
         tokenizer.base_tokenizer = base_tokenizer
-        
-        # Load custom config
-        custom_config_path = os.path.join(load_directory, 'custom_tokenizer_config.json')
-        if os.path.exists(custom_config_path):
-            with open(custom_config_path, 'r') as f:
-                config = json.load(f)
-            tokenizer.custom_vocab_size = config['custom_vocab_size']
-            tokenizer.layer_vocab_sizes = config['layer_vocab_sizes']
-            tokenizer.num_semantic_tokens = config['num_semantic_tokens']
-        else:
-            tokenizer.custom_vocab_size = len(base_tokenizer)
+        tokenizer.base_vocab_size = base_tokenizer.vocab_size - config['num_semantic_tokens']
+        tokenizer.custom_vocab_size = config['custom_vocab_size']
+        tokenizer.layer_vocab_sizes = config['layer_vocab_sizes']
+        tokenizer.num_semantic_tokens = config['num_semantic_tokens']
         
         return tokenizer
 
@@ -115,10 +129,44 @@ class TIGERModel(nn.Module):
 
     @classmethod
     def from_pretrained(cls, load_directory: str):
-        with open(os.path.join(load_directory, 'tiger_config.json'), 'r') as f:
+        """Load a saved TIGER model.
+        
+        Args:
+            load_directory: Directory containing the saved model
+            
+        Returns:
+            TIGERModel instance with loaded weights
+        """
+        tiger_config_path = os.path.join(load_directory, 'tiger_config.json')
+        if not os.path.exists(tiger_config_path):
+            raise FileNotFoundError(
+                f"TIGER config not found at {tiger_config_path}. "
+                "Make sure the model was saved with TIGERModel.save_pretrained()"
+            )
+        
+        with open(tiger_config_path, 'r') as f:
             config = json.load(f)
         
-        model = cls(base_model=config['base_model'], layer_vocab_sizes=config['layer_vocab_sizes'])
-        model.model = T5ForConditionalGeneration.from_pretrained(load_directory)
-        model.tokenizer = TIGERTokenizer.from_pretrained(load_directory)
-        return model
+        # Load tokenizer first
+        tokenizer = TIGERTokenizer.from_pretrained(load_directory)
+        
+        # Load the T5 model directly from the saved directory
+        t5_model = T5ForConditionalGeneration.from_pretrained(load_directory)
+        
+        # Verify vocab size matches
+        if t5_model.config.vocab_size != len(tokenizer):
+            raise ValueError(
+                f"Model vocab size ({t5_model.config.vocab_size}) doesn't match "
+                f"tokenizer vocab size ({len(tokenizer)})"
+            )
+        
+        # Create TIGER model instance without calling __init__ to avoid re-initialization
+        tiger_model = cls.__new__(cls)
+        super(TIGERModel, tiger_model).__init__()
+        tiger_model.base_model_path = config['base_model']
+        tiger_model.config = t5_model.config
+        tiger_model.model = t5_model
+        tiger_model.tokenizer = tokenizer
+        tiger_model.layer_vocab_sizes = config['layer_vocab_sizes']
+        
+        return tiger_model

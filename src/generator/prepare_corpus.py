@@ -1,5 +1,5 @@
 """
-Step G2: Generate Training Corpus for the T5 Generator Model.  
+Step G2: Generate Training Corpus for the T5 Generator Model.   
 
 This script reads the raw playlist data, combines it with the generated
 semantic IDs (song-to-cluster map), and produces train/val/test splits
@@ -43,12 +43,41 @@ class CorpusBuilder:
         if not os.path.exists(self.data_config.semantic_ids_file):
             logger.error(f"FATAL: Semantic ID file not found. Please run Step G1 first.")
             sys.exit(1)
+        
         mapping = {}
-        with open(self.data_config.semantic_ids_file, 'r') as f:
-            for line in f:
-                item = json.loads(line)
-                mapping[item['song_id']] = item['semantic_ids']
-        logger.info(f"Loaded {len(mapping)} song-to-semantic-ID mappings.")
+        line_count = 0
+        error_count = 0
+        
+        with open(self.data_config.semantic_ids_file, 'r', encoding='utf-8') as f:
+            for line_num, line in enumerate(f, 1):
+                line_count += 1
+                try:
+                    item = json.loads(line.strip())
+                    if 'song_id' not in item or 'semantic_ids' not in item:
+                        logger.warning(f"Line {line_num}: Missing required fields")
+                        error_count += 1
+                        continue
+                    
+                    semantic_ids = item['semantic_ids']
+                    if not isinstance(semantic_ids, list) or len(semantic_ids) != 3:
+                        logger.warning(f"Line {line_num}: Invalid semantic_ids format (expected list of 3 integers)")
+                        error_count += 1
+                        continue
+                    
+                    mapping[item['song_id']] = semantic_ids
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Line {line_num}: JSON decode error - {e}")
+                    error_count += 1
+                    continue
+        
+        logger.info(f"Loaded {len(mapping)} song-to-semantic-ID mappings from {line_count} lines.")
+        if error_count > 0:
+            logger.warning(f"Encountered {error_count} errors while loading semantic IDs")
+        
+        if len(mapping) == 0:
+            logger.error("FATAL: No valid semantic IDs loaded!")
+            sys.exit(1)
+        
         return mapping
 
     def _load_playlist_info(self) -> dict:
@@ -64,9 +93,27 @@ class CorpusBuilder:
     def _load_playlist_songs(self) -> dict:
         logger.info(f"Loading playlist songs from {self.data_config.playlist_songs_file}...")
         try:
-            df = pd.read_csv(self.data_config.playlist_songs_file, sep='\t', header=None, names=['playlist_id', 'song_id'], dtype=str)
-            grouped = df.groupby('playlist_id')['song_id'].apply(list)
-            return grouped.to_dict()
+            # Use chunked reading for better memory efficiency with large files
+            chunk_size = 1000000
+            playlist_songs = {}
+            
+            for chunk in pd.read_csv(
+                self.data_config.playlist_songs_file, 
+                sep='\t', 
+                header=None, 
+                names=['playlist_id', 'song_id'], 
+                dtype=str,
+                chunksize=chunk_size
+            ):
+                grouped = chunk.groupby('playlist_id')['song_id'].apply(list)
+                for playlist_id, songs in grouped.items():
+                    if playlist_id in playlist_songs:
+                        playlist_songs[playlist_id].extend(songs)
+                    else:
+                        playlist_songs[playlist_id] = songs
+            
+            logger.info(f"Loaded {len(playlist_songs)} playlists")
+            return playlist_songs
         except FileNotFoundError:
             logger.error(f"FATAL: Playlist songs file not found at {self.data_config.playlist_songs_file}")
             sys.exit(1)
@@ -81,18 +128,36 @@ class CorpusBuilder:
         """
         logger.info("Building text-to-text corpus...")
         corpus = []
+        stats = {
+            'total_playlists': len(playlist_songs),
+            'playlists_without_info': 0,
+            'playlists_without_title': 0,
+            'playlists_too_few_songs': 0,
+            'total_songs': 0,
+            'songs_with_semantic_ids': 0,
+            'songs_without_semantic_ids': 0,
+        }
+        
         for glid, songs in tqdm(playlist_songs.items(), desc="Processing playlists"):
-            if glid not in playlist_info or not songs:
+            if glid not in playlist_info:
+                stats['playlists_without_info'] += 1
+                continue
+            
+            if not songs:
                 continue
 
             title = playlist_info[glid].get('listname', '')
             if not title:
+                stats['playlists_without_title'] += 1
                 continue
 
             # Per our "embrace collision" strategy, we do not de-duplicate songs or tokens here.
             sorted_songs = sorted(songs)
             semantic_tokens = []
             songs_with_semantic_ids = 0 # Count songs that actually have semantic IDs
+            
+            stats['total_songs'] += len(sorted_songs)
+            
             for song_id in sorted_songs:
                 if song_id in semantic_id_map:
                     # Create layer-specific tokens for each of the three layers
@@ -105,9 +170,13 @@ class CorpusBuilder:
                     ]
                     semantic_tokens.extend(tokens)
                     songs_with_semantic_ids += 1
+                    stats['songs_with_semantic_ids'] += 1
+                else:
+                    stats['songs_without_semantic_ids'] += 1
             
             # Filter out playlists with too few songs after semantic ID filtering
             if songs_with_semantic_ids < self.data_config.min_songs_per_playlist:
+                stats['playlists_too_few_songs'] += 1
                 continue
 
             # If no semantic tokens were found (e.g., all songs filtered out), skip
@@ -120,10 +189,26 @@ class CorpusBuilder:
             corpus.append((glid, title, output_sequence))
         
         logger.info(f"Successfully built corpus with {len(corpus)} entries.")
+        logger.info("Corpus building statistics:")
+        logger.info(f"  Total playlists: {stats['total_playlists']}")
+        logger.info(f"  Valid corpus entries: {len(corpus)}")
+        logger.info(f"  Playlists without info: {stats['playlists_without_info']}")
+        logger.info(f"  Playlists without title: {stats['playlists_without_title']}")
+        logger.info(f"  Playlists with too few songs: {stats['playlists_too_few_songs']}")
+        logger.info(f"  Total songs processed: {stats['total_songs']}")
+        logger.info(f"  Songs with semantic IDs: {stats['songs_with_semantic_ids']} ({stats['songs_with_semantic_ids']/stats['total_songs']*100:.2f}%)")
+        logger.info(f"  Songs without semantic IDs: {stats['songs_without_semantic_ids']} ({stats['songs_without_semantic_ids']/stats['total_songs']*100:.2f}%)")
+        
+        if len(corpus) == 0:
+            logger.error("FATAL: No valid corpus entries generated!")
+            sys.exit(1)
+        
         return corpus
 
     def _split_and_save(self, corpus: list):
         logger.info("Splitting data and saving to files...")
+        # Set seed for reproducible splits
+        random.seed(self.config.seed)
         random.shuffle(corpus)
         train_ratio = self.data_config.train_split_ratio
         val_ratio = self.data_config.val_split_ratio
@@ -138,6 +223,13 @@ class CorpusBuilder:
         test_data = corpus[val_end_idx:] # Remaining data for test
 
         logger.info(f"Data split: {len(train_data)} train, {len(val_data)} validation, {len(test_data)} test.")
+        
+        # Validate split ratios
+        if len(val_data) == 0:
+            logger.warning("Validation set is empty! Consider adjusting split ratios.")
+        if len(test_data) == 0:
+            logger.warning("Test set is empty! Consider adjusting split ratios.")
+        
         output_dir = os.path.join(self.config.output_dir, "generator")
         os.makedirs(output_dir, exist_ok=True)
         self._save_to_tsv(train_data, os.path.join(output_dir, "train.tsv"))

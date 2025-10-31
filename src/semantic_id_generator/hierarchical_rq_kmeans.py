@@ -1,5 +1,5 @@
 """
-改造后的BalanceRqKMeans核心类                                                                                                   
+改造后的BalanceRqKMeans核心类                                                                                                                         
 支持：
 1. 训练和预测的统一接口
 2. 单个维度的group_dims和单一均匀权重hierarchical_weights
@@ -90,7 +90,7 @@ class CheckpointManager:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.metadata_file = self.checkpoint_dir / "checkpoint_metadata.json"
     
-    def save_layer_checkpoint(self, layer: int, kmeans_model: Union[KMeans, List],
+    def save_layer_checkpoint(self, layer: int,
                              cluster_ids: torch.Tensor, residual_data: torch.Tensor,
                              cluster_centers: Optional[torch.Tensor] = None,
                              match_matrix: Optional[List] = None):
@@ -213,7 +213,6 @@ class HierarchicalRQKMeans:
         
         # 训练状态
         self.is_trained = False
-        self.kmeans_models = []  # 保存每层的KMeans模型
         self.cluster_centers_list = []  # 保存每层的聚类中心
         self.match_matrices = []  # 保存匹配矩阵
         self.result_cluster_ids = []  # 保存每层的聚类ID
@@ -228,14 +227,14 @@ class HierarchicalRQKMeans:
     
     @staticmethod
     def _calculate_safe_batch_size(X: torch.Tensor, device: torch.device, 
-                                   initial_batch_size: int = 100000) -> int:
+                                   initial_batch_size: int = 500000) -> int:
         """
         动态计算安全的batch_size，防止OOM
         
         Args:
             X: 输入数据张量
             device: 计算设备
-            initial_batch_size: 初始batch_size，默认100000
+            initial_batch_size: 初始batch_size，默认500000
         
         Returns:
             安全的batch_size
@@ -243,13 +242,20 @@ class HierarchicalRQKMeans:
         element_size = X.element_size()
         
         if device.type == 'cuda':
-            # 获取GPU可用内存，预留20%的安全边际
-            available_memory = torch.cuda.mem_get_info()[0]
-            safe_batch = min(initial_batch_size, int(0.8 * available_memory / 
-                            (element_size * X.shape[1] * 3)))
+            try:
+                # 获取GPU可用内存，预留35%的安全边际（更保守）
+                available_memory = torch.cuda.mem_get_info()[0]
+                # 计算每个样本需要的内存：输入 + 距离矩阵 + 其他临时变量
+                memory_per_sample = element_size * X.shape[1] * 4  # 4倍用于距离矩阵等
+                safe_batch = int(0.65 * available_memory / memory_per_sample)
+                safe_batch = min(initial_batch_size, safe_batch)
+                logger.debug(f"GPU memory: {available_memory / 1e9:.2f}GB, safe_batch: {safe_batch:,}")
+            except Exception as e:
+                logger.warning(f"Failed to get GPU memory info: {e}, using conservative batch size")
+                safe_batch = initial_batch_size // 4
         else:
-            # CPU模式下使用初始batch_size
-            safe_batch = initial_batch_size
+            # CPU模式下使用更小的batch_size
+            safe_batch = initial_batch_size // 4
         
         safe_batch = max(1, safe_batch)
         return safe_batch
@@ -364,7 +370,6 @@ class HierarchicalRQKMeans:
                 logger.info(f"  - Applied weights in {weight_time:.2f}s")
                 
                 # 临时存储本层的训练结果（只有成功才会保存到正式列表）
-                layer_kmeans_model = None
                 layer_cluster_centers = None
                 layer_cluster_ids = None
                 layer_match_matrix = None
@@ -374,24 +379,18 @@ class HierarchicalRQKMeans:
                     # 策略1：直接聚类（通常是第1层）
                     logger.info(f"  - Strategy: Direct clustering (Layer 0)")
                     train_start = time.time()
-                    kmeans_model, cluster_ids = self._train_layer_0(weighted_data, layer)
+                    layer_cluster_centers, layer_cluster_ids = self._train_layer_0(weighted_data, layer)
                     train_time = time.time() - train_start
-                    layer_kmeans_model = kmeans_model
-                    layer_cluster_centers = kmeans_model.cluster_centers
-                    layer_cluster_ids = cluster_ids
                     logger.info(f"  - Layer 0 training completed in {train_time:.2f}s")
                     
                 elif layer == len(self.config.layer_clusters) - 1:
                     # 策略2：最后一层（两个KMeans + match_matrix）
                     logger.info(f"  - Strategy: Last layer (2 KMeans + match matrix)")
                     train_start = time.time()
-                    kmeans_models, cluster_ids = self._train_last_layer(
+                    layer_cluster_centers, layer_cluster_ids = self._train_last_layer(
                         weighted_data, layer
                     )
                     train_time = time.time() - train_start
-                    layer_kmeans_model = kmeans_models
-                    layer_cluster_centers = torch.cat([m.cluster_centers for m in kmeans_models])
-                    layer_cluster_ids = cluster_ids
                     if len(self.match_matrices) > 0:
                         layer_match_matrix = self.match_matrices[-1]
                     logger.info(f"  - Last layer training completed in {train_time:.2f}s")
@@ -400,17 +399,13 @@ class HierarchicalRQKMeans:
                     # 策略3：中间层（递归聚类）
                     logger.info(f"  - Strategy: Middle layer (recursive clustering)")
                     train_start = time.time()
-                    kmeans_centers, cluster_ids = self._train_middle_layer(
+                    layer_cluster_centers, layer_cluster_ids = self._train_middle_layer(
                         weighted_data, layer
                     )
                     train_time = time.time() - train_start
-                    layer_kmeans_model = None
-                    layer_cluster_centers = kmeans_centers
-                    layer_cluster_ids = cluster_ids
                     logger.info(f"  - Middle layer training completed in {train_time:.2f}s")
                 
                 # 先更新内部状态（这样_compute_residuals可以访问cluster_centers_list）
-                self.kmeans_models.append(layer_kmeans_model)
                 self.cluster_centers_list.append(layer_cluster_centers)
                 self.result_cluster_ids.append(layer_cluster_ids)
                 
@@ -429,8 +424,7 @@ class HierarchicalRQKMeans:
                     try:
                         checkpoint_start = time.time()
                         self.checkpoint_manager.save_layer_checkpoint(
-                            layer, 
-                            None,
+                            layer,
                             layer_cluster_ids,
                             residual_data,
                             layer_cluster_centers,
@@ -505,13 +499,13 @@ class HierarchicalRQKMeans:
             # 应用权重
             weighted_data = self._apply_weights(current_data, layer)
             
-            # 预测当前层
+            # 预测当前层（传入之前层的预测结果）
             if layer == 0:
                 cluster_ids = self._predict_layer_0(weighted_data, layer)
             elif layer == len(self.config.layer_clusters) - 1:
-                cluster_ids = self._predict_last_layer(weighted_data, layer)
+                cluster_ids = self._predict_last_layer(weighted_data, layer, all_cluster_ids)
             else:
-                cluster_ids = self._predict_middle_layer(weighted_data, layer)
+                cluster_ids = self._predict_middle_layer(weighted_data, layer, all_cluster_ids)
             
             all_cluster_ids.append(cluster_ids)
             
@@ -525,7 +519,7 @@ class HierarchicalRQKMeans:
     
     def _apply_weights(self, data: torch.Tensor, layer: int) -> torch.Tensor:
         """
-        应用层级权重到数据
+        应用层级权重到数据（优化：避免克隆，使用向量化操作）
         
         Args:
             data: 输入数据
@@ -534,17 +528,19 @@ class HierarchicalRQKMeans:
         Returns:
             加权后的数据
         """
-        weighted_data = data.clone()
         weights = self.config.hierarchical_weights[layer]
         
+        # 创建权重张量，避免克隆整个数据
+        weight_tensor = torch.ones(data.shape[1], device=data.device, dtype=data.dtype)
         cur_idx = 0
         for i, dim in enumerate(self.config.group_dims):
-            weighted_data[:, cur_idx:cur_idx+dim] *= weights[i]
+            weight_tensor[cur_idx:cur_idx+dim] = weights[i]
             cur_idx += dim
         
-        return weighted_data
+        # 使用广播乘法，避免克隆
+        return data * weight_tensor.unsqueeze(0)
     
-    def _train_layer_0(self, X: torch.Tensor, layer: int) -> Tuple[KMeans, torch.Tensor]:
+    def _train_layer_0(self, X: torch.Tensor, layer: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         训练第1层：直接训练n_clusters个聚类中心
         
@@ -553,7 +549,7 @@ class HierarchicalRQKMeans:
             layer: 层索引
         
         Returns:
-            (kmeans_model, cluster_ids): KMeans模型和聚类ID
+            (cluster_centers, cluster_ids): 聚类中心和聚类ID
         """
         n_clusters = self.config.layer_clusters[layer]
         
@@ -587,12 +583,18 @@ class HierarchicalRQKMeans:
             online=False
         )
         
-        # 获取聚类ID（转换为torch.Tensor以保持类型一致）
+        # 获取聚类中心和ID
+        cluster_centers = kmeans.cluster_centers.detach()
         cluster_ids = kmeans.predict(X, balanced=False)
         if isinstance(cluster_ids, np.ndarray):
             cluster_ids = torch.from_numpy(cluster_ids).to(self.device)
         
-        return kmeans, cluster_ids
+        # 及时释放KMeans模型
+        del kmeans
+        if self.device.type == 'cuda':
+            torch.cuda.empty_cache()
+        
+        return cluster_centers, cluster_ids
     
     def _train_middle_layer(self, X: torch.Tensor, layer: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -648,7 +650,8 @@ class HierarchicalRQKMeans:
                 online=False
             )
             
-            kmeans_centers_list.append(sub_kmeans.cluster_centers)
+            # 优化：使用detach()断开计算图，避免保留历史记录
+            kmeans_centers_list.append(sub_kmeans.cluster_centers.detach())
             
             # 关键：及时释放显存，避免累积
             del sub_kmeans, sub_data, idx
@@ -667,7 +670,7 @@ class HierarchicalRQKMeans:
         
         return kmeans_centers, cluster_ids
     
-    def _train_last_layer(self, X: torch.Tensor, layer: int) -> Tuple[List[KMeans], torch.Tensor]:
+    def _train_last_layer(self, X: torch.Tensor, layer: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         训练最后一层：使用两个KMeans模型，通过match_matrix筛选最优聚类
         
@@ -676,7 +679,7 @@ class HierarchicalRQKMeans:
             layer: 层索引
         
         Returns:
-            (kmeans_models, cluster_ids): KMeans模型列表和聚类ID
+            (cluster_centers, cluster_ids): 合并的聚类中心和聚类ID
         """
         n_clusters = self.config.layer_clusters[layer]
         need_clusters = self.config.need_clusters[layer]
@@ -697,8 +700,8 @@ class HierarchicalRQKMeans:
         safe_batch = self._calculate_safe_batch_size(X, self.device)
         logger.info(f"    - Safe batch_size: {safe_batch:,}")
         
-        # 训练两个KMeans模型
-        kmeans_models = []
+        # 训练两个KMeans模型，只保存聚类中心
+        kmeans_centers_list = []
         for part in tqdm(range(2), desc="    KMeans models", leave=False):
             kmeans = KMeans(n_clusters=n_clusters, device=self.device, balanced=True)
             kmeans.fit(
@@ -709,10 +712,14 @@ class HierarchicalRQKMeans:
                 half=n_clusters >= 512,
                 online=False
             )
-            kmeans_models.append(kmeans)
+            # 优化：只保存聚类中心，不保存整个模型
+            kmeans_centers_list.append(kmeans.cluster_centers.detach())
+            del kmeans
+            if self.device.type == 'cuda':
+                torch.cuda.empty_cache()
         
         # 合并聚类中心
-        cur_kmeans_centers = torch.cat([m.cluster_centers for m in kmeans_models], dim=0)
+        cur_kmeans_centers = torch.cat(kmeans_centers_list, dim=0)
         
         # 构建match_matrix
         prev_prev_cluster_ids = self.result_cluster_ids[-2].cpu().numpy()
@@ -734,7 +741,7 @@ class HierarchicalRQKMeans:
             X, cur_kmeans_centers, before_cluster_ids, match_matrix, layer
         )
         
-        return kmeans_models, cluster_ids
+        return cur_kmeans_centers, cluster_ids
     
     def _reassign_clusters_middle_layer(self, X: torch.Tensor, kmeans_centers: torch.Tensor,
                                        prev_cluster_ids: torch.Tensor, layer: int) -> torch.Tensor:
@@ -764,24 +771,30 @@ class HierarchicalRQKMeans:
         cluster_ids = []
         for i in tqdm(range(0, len(X), safe_batch), total=(len(X) + safe_batch - 1) // safe_batch, 
                       desc="    Reassigning", leave=False):
-            batch = X[i:i+safe_batch]
+            batch = X[i:i+safe_batch].float().to(self.device)
             batch_cluster_ids = prev_cluster_ids[i:i+safe_batch]
             
             # 计算距离
             distance = pairwise_distance_full(batch, kmeans_centers, device=self.device)
             
-            # 基于前一层的聚类ID，生成匹配矩阵
-            match_matrix = torch.nn.functional.one_hot(batch_cluster_ids, num_classes=pre_need_cluster)
-            match_matrix = torch.repeat_interleave(match_matrix, self.config.layer_clusters[layer], dim=1)
-            match_matrix = match_matrix.float().to(distance.device)
+            # 优化：不创建完整的one-hot矩阵，直接创建掩码
+            # 创建掩码：只有对应簇的位置为1
+            mask = torch.zeros_like(distance)
+            for cluster_idx in range(pre_need_cluster):
+                cluster_mask = (batch_cluster_ids == cluster_idx)
+                if cluster_mask.any():
+                    # 只为该簇的样本设置对应的聚类中心位置
+                    start_idx = cluster_idx * cur_need_cluster
+                    end_idx = start_idx + cur_need_cluster
+                    mask[cluster_mask, start_idx:end_idx] = 1.0
             
-            # 将不匹配的位置置为inf，使得这些位置无法被选中
-            distance = distance + 10000.0 * (1 - match_matrix)
+            # 原地操作，避免创建新矩阵
+            distance.add_(10000.0 * (1 - mask))
             
             cluster_assignments = torch.argmin(distance, dim=1)
-            cluster_ids.append(cluster_assignments)
+            cluster_ids.append(cluster_assignments.cpu())
             
-            del batch, distance, match_matrix
+            del batch, distance, mask
             if self.device.type == 'cuda':
                 torch.cuda.empty_cache()
         
@@ -812,31 +825,31 @@ class HierarchicalRQKMeans:
         safe_batch = self._calculate_safe_batch_size(X, self.device)
         logger.info(f"    - Safe batch_size: {safe_batch:,}")
         
-        # 将match_matrix转换为torch.Tensor
-        cur_match_matrix = torch.tensor(match_matrix, dtype=torch.float32, device=self.device)
+        # 优化：保持match_matrix在CPU，避免占用显存
+        match_matrix_np = np.array(match_matrix, dtype=np.float32)
         
         cluster_ids = []
         
         for i in tqdm(range(0, len(X), safe_batch), total=(len(X) + safe_batch - 1) // safe_batch,
                       desc="    Reassigning", leave=False):
-            batch = X[i:i+safe_batch]
+            batch = X[i:i+safe_batch].float().to(self.device)
             batch_before_ids = before_cluster_ids[i:i+safe_batch]
             
             # 计算距离
             distance = pairwise_distance_full(batch, kmeans_centers, device=self.device)
             
-            # 基于before_cluster_ids，获取match_matrix
-            batch_before_ids_tensor = torch.from_numpy(batch_before_ids).long().to(self.device)
-            match_matrix_batch = cur_match_matrix[batch_before_ids_tensor]
-            match_matrix_batch = match_matrix_batch.to(distance.device)
+            # 优化：从CPU match_matrix中索引，然后转移到GPU
+            match_matrix_batch = torch.from_numpy(
+                match_matrix_np[batch_before_ids]
+            ).float().to(self.device)
             
-            # 将不匹配的位置置为inf，使得这些位置无法被选中
-            distance = distance + 10000.0 * (1 - match_matrix_batch)
+            # 原地操作，避免创建新矩阵
+            distance.add_(10000.0 * (1 - match_matrix_batch))
             
             cluster_assignments = torch.argmin(distance, dim=1)
-            cluster_ids.append(cluster_assignments)
+            cluster_ids.append(cluster_assignments.cpu())
             
-            del batch, distance, match_matrix_batch, batch_before_ids_tensor
+            del batch, distance, match_matrix_batch
             if self.device.type == 'cuda':
                 torch.cuda.empty_cache()
         
@@ -901,24 +914,27 @@ class HierarchicalRQKMeans:
                                       iter_limit=adaptive_iter, tqdm_flag=False, half=False, online=False)
                     sub_centers = sub_kmeans.cluster_centers.cpu().numpy()
                 
-                # 为每个sub_center找到最近的cur_kmeans_center
+                # 优化：使用向量化操作计算距离，避免嵌套循环
                 match_matrix_row = [0] * cur_n_cluster
                 exist_idx_set = set()
                 
-                for j_idx in range(len(sub_centers)):
-                    min_dist = np.inf
-                    min_idx = -1
+                # 批量计算距离：(len(sub_centers), cur_n_cluster)
+                sub_centers_tensor = torch.from_numpy(sub_centers).float().to(self.device)
+                cur_centers_tensor = cur_kmeans_centers.float()
+                distances = torch.cdist(sub_centers_tensor, cur_centers_tensor)
+                
+                for j_idx in range(min(len(sub_centers), cur_need_cluster)):
+                    # 找到最近的未使用中心
+                    dist_row = distances[j_idx].clone()
+                    dist_row[list(exist_idx_set)] = float('inf')
+                    min_idx = torch.argmin(dist_row).item()
                     
-                    for k in range(cur_n_cluster):
-                        if k not in exist_idx_set:
-                            dist = np.linalg.norm(sub_centers[j_idx] - cur_kmeans_centers_np[k])
-                            if dist < min_dist:
-                                min_dist = dist
-                                min_idx = k
-                    
-                    if min_idx != -1:
-                        match_matrix_row[min_idx] = 1
-                        exist_idx_set.add(min_idx)
+                    match_matrix_row[min_idx] = 1
+                    exist_idx_set.add(min_idx)
+                
+                del sub_centers_tensor, cur_centers_tensor, distances
+                if self.device.type == 'cuda':
+                    torch.cuda.empty_cache()
                 
                 # 如果数量不够，随机选择
                 if len(exist_idx_set) < cur_need_cluster:
@@ -985,22 +1001,28 @@ class HierarchicalRQKMeans:
         if cluster_ids.dtype != torch.long:
             cluster_ids = cluster_ids.long()
         
+        # 确保在同一设备上
+        kmeans_centers = kmeans_centers.to(X.device)
+        
         # 获取每个样本对应的聚类中心
         assigned_centers = kmeans_centers[cluster_ids]
         
-        # 计算残差
+        # 优化：直接计算残差，不克隆
         residuals = X - assigned_centers
         
-        # 按维度分组归一化
-        normalized_residuals = residuals.clone()
+        # 按维度分组归一化（原地操作）
         cur_idx = 0
         for dim in self.config.group_dims:
-            group_residuals = normalized_residuals[:, cur_idx:cur_idx+dim]
+            group_residuals = residuals[:, cur_idx:cur_idx+dim]
             norms = torch.norm(group_residuals, dim=1, keepdim=True) + 1e-8
-            normalized_residuals[:, cur_idx:cur_idx+dim] = group_residuals / norms
+            residuals[:, cur_idx:cur_idx+dim].div_(norms)  # 原地除法
             cur_idx += dim
         
-        return normalized_residuals
+        del assigned_centers, kmeans_centers
+        if X.device.type == 'cuda':
+            torch.cuda.empty_cache()
+        
+        return residuals
     
     def _predict_layer_0(self, X: torch.Tensor, layer: int) -> torch.Tensor:
         """
@@ -1022,7 +1044,7 @@ class HierarchicalRQKMeans:
             batch = X[i:i+safe_batch]
             distance = pairwise_distance_full(batch, kmeans_centers, device=self.device)
             cluster_assignments = torch.argmin(distance, dim=1)
-            cluster_ids.append(cluster_assignments)
+            cluster_ids.append(cluster_assignments.cpu())
             
             del batch, distance
             if self.device.type == 'cuda':
@@ -1030,19 +1052,20 @@ class HierarchicalRQKMeans:
         
         return torch.cat(cluster_ids)
     
-    def _predict_middle_layer(self, X: torch.Tensor, layer: int) -> torch.Tensor:
+    def _predict_middle_layer(self, X: torch.Tensor, layer: int, all_cluster_ids: List[torch.Tensor]) -> torch.Tensor:
         """
         预测中间层：在前一层对应簇内分配聚类
         
         Args:
             X: 输入数据张量
             layer: 层索引
+            all_cluster_ids: 之前层的预测聚类ID列表
         
         Returns:
             聚类ID
         """
         kmeans_centers = self.cluster_centers_list[layer]
-        prev_cluster_ids = self.result_cluster_ids[layer - 1]
+        prev_cluster_ids = all_cluster_ids[layer - 1]
         pre_need_cluster = self.config.need_clusters[layer - 1]
         cur_need_cluster = self.config.need_clusters[layer]
         
@@ -1062,18 +1085,22 @@ class HierarchicalRQKMeans:
             # 计算距离
             distance = pairwise_distance_full(batch, kmeans_centers, device=self.device)
             
-            # 基于前一层的聚类ID，生成匹配矩阵
-            match_matrix = torch.nn.functional.one_hot(batch_cluster_ids, num_classes=pre_need_cluster)
-            match_matrix = torch.repeat_interleave(match_matrix, self.config.layer_clusters[layer], dim=1)
-            match_matrix = match_matrix.float().to(distance.device)
+            # 优化：不创建完整的one-hot矩阵，直接创建掩码
+            mask = torch.zeros_like(distance)
+            for cluster_idx in range(pre_need_cluster):
+                cluster_mask = (batch_cluster_ids == cluster_idx)
+                if cluster_mask.any():
+                    start_idx = cluster_idx * cur_need_cluster
+                    end_idx = start_idx + cur_need_cluster
+                    mask[cluster_mask, start_idx:end_idx] = 1.0
             
-            # 将不匹配的位置置为inf，使得这些位置无法被选中
-            distance = distance + 10000.0 * (1 - match_matrix)
+            # 原地操作
+            distance.add_(10000.0 * (1 - mask))
             
             cluster_assignments = torch.argmin(distance, dim=1)
-            cluster_ids.append(cluster_assignments)
+            cluster_ids.append(cluster_assignments.cpu())
             
-            del batch, distance, match_matrix
+            del batch, distance, mask
             if self.device.type == 'cuda':
                 torch.cuda.empty_cache()
         
@@ -1084,13 +1111,14 @@ class HierarchicalRQKMeans:
         
         return cluster_ids
     
-    def _predict_last_layer(self, X: torch.Tensor, layer: int) -> torch.Tensor:
+    def _predict_last_layer(self, X: torch.Tensor, layer: int, all_cluster_ids: List[torch.Tensor]) -> torch.Tensor:
         """
         预测最后一层：使用match_matrix约束进行聚类分配
         
         Args:
             X: 输入数据张量
             layer: 层索引
+            all_cluster_ids: 之前层的预测聚类ID列表
         
         Returns:
             聚类ID
@@ -1098,9 +1126,9 @@ class HierarchicalRQKMeans:
         cur_kmeans_centers = self.cluster_centers_list[layer]
         match_matrix = self.match_matrices[layer - 1] if layer - 1 < len(self.match_matrices) else []
         
-        # result_cluster_ids中的数据已是torch.Tensor，转换为numpy用于索引计算
-        prev_prev_cluster_ids = self.result_cluster_ids[-2].cpu().numpy()
-        prev_cluster_ids = self.result_cluster_ids[-1].cpu().numpy()
+        # 使用当前预测数据的聚类ID，转换为numpy用于索引计算
+        prev_prev_cluster_ids = all_cluster_ids[-2].cpu().numpy()
+        prev_cluster_ids = all_cluster_ids[-1].cpu().numpy()
         prev_prev_need_cluster = self.config.need_clusters[layer - 2]
         
         # before_cluster_ids = prev_prev_cluster_ids * prev_prev_need_cluster + prev_cluster_ids
@@ -1109,10 +1137,10 @@ class HierarchicalRQKMeans:
         # 动态计算安全batch_size
         safe_batch = self._calculate_safe_batch_size(X, self.device)
         
-        # 预先转换match_matrix到GPU（如果存在）
-        cur_match_matrix = None
+        # 优化：保持match_matrix在CPU，避免占用显存
+        match_matrix_np = None
         if match_matrix:
-            cur_match_matrix = torch.tensor(match_matrix, dtype=torch.float32, device=self.device)
+            match_matrix_np = np.array(match_matrix, dtype=np.float32)
         
         cluster_ids = []
         for i in tqdm(range(0, len(X), safe_batch), total=(len(X) + safe_batch - 1) // safe_batch,
@@ -1124,18 +1152,19 @@ class HierarchicalRQKMeans:
             distance = pairwise_distance_full(batch, cur_kmeans_centers, device=self.device)
             
             # 基于before_cluster_ids，获取match_matrix
-            if cur_match_matrix is not None:
-                batch_before_ids_tensor = torch.from_numpy(batch_before_ids).long().to(self.device)
-                match_matrix_batch = cur_match_matrix[batch_before_ids_tensor]
-                match_matrix_batch = match_matrix_batch.to(distance.device)
+            if match_matrix_np is not None:
+                # 优化：从CPU match_matrix中索引，然后转移到GPU
+                match_matrix_batch = torch.from_numpy(
+                    match_matrix_np[batch_before_ids]
+                ).float().to(self.device)
                 
-                # 将不匹配的位置置为inf，使得这些位置无法被选中
-                distance = distance + 10000.0 * (1 - match_matrix_batch)
+                # 原地操作
+                distance.add_(10000.0 * (1 - match_matrix_batch))
                 
-                del batch_before_ids_tensor, match_matrix_batch
+                del match_matrix_batch
             
             cluster_assignments = torch.argmin(distance, dim=1)
-            cluster_ids.append(cluster_assignments)
+            cluster_ids.append(cluster_assignments.cpu())
             
             del batch, distance
             if self.device.type == 'cuda':
@@ -1179,7 +1208,6 @@ class HierarchicalRQKMeans:
                     f"Use --clear-checkpoints flag to start training from scratch."
                 )
             
-            self.kmeans_models.append(None)
             self.cluster_centers_list.append(checkpoint['cluster_centers'])
             self.result_cluster_ids.append(checkpoint['cluster_ids'])
             
@@ -1231,7 +1259,6 @@ class HierarchicalRQKMeans:
             self.cluster_centers_list = [
                 torch.from_numpy(c).to(self.device) for c in centers_list
             ]
-            self.kmeans_models = [None] * len(self.cluster_centers_list)
         
         # 加载匹配矩阵
         matrix_file = model_dir / "match_matrices.pkl"
