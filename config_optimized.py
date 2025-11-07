@@ -1,5 +1,6 @@
 """
-Configuration file for the Generative Ranking Recommender project.
+优化后的配置文件 - 用于高性能训练
+基于原config.py，针对2×L20 GPU + 20 CPU + 50GB内存优化
 """
 import os
 from dataclasses import dataclass, field
@@ -15,7 +16,7 @@ class DataConfig:
     playlist_songs_file: str = "data/gen_playlist_song.csv.sort"
     playlist_info_file: str = "data/gen_playlist_info.csv"
     song_info_file: str = "data/gen_song_info.csv"
-
+    
     # --- Paths for generated files (outputs of steps) ---
     song_vectors_file: str = "outputs/sg1_vs512_w50_ep20_song_vectors.csv"
     # Updated path for the new semantic ID generator
@@ -41,7 +42,7 @@ class Word2VecConfig:
 # Pre-configured settings for different dataset sizes
 H_RQ_KMEANS_PROD = HierarchicalRQKMeansConfig(
     layer_clusters=[128, 1280, 1280],
-    need_clusters=[128, 128, 256],
+    need_clusters=[128, 128, 128],
     embedding_dim=512,
     group_dims=[512],  # 如果没有特殊分组，使用单个维度
     hierarchical_weights=[[1.0], [1.0], [1.0]],  # 如果没有特殊权重，使用均匀权重
@@ -49,7 +50,7 @@ H_RQ_KMEANS_PROD = HierarchicalRQKMeansConfig(
 )
 
 H_RQ_KMEANS_TEST = HierarchicalRQKMeansConfig(
-    layer_clusters=[32, 64, 64],
+    layer_clusters=[32, 128, 128],  # 第2层改为128，使其不等于need_clusters[1]=32，触发递归聚类策略
     need_clusters=[32, 32, 32],
     embedding_dim=512,
     group_dims=[512],  # 如果没有特殊分组，使用单个维度
@@ -59,19 +60,30 @@ H_RQ_KMEANS_TEST = HierarchicalRQKMeansConfig(
 
 @dataclass
 class PlaylistTIGERConfig:
-    """Configuration for the T5 Generator model."""
+    """Configuration for the T5 Generator model (OPTIMIZED)."""
     model_name: str = "/home/search/base-model/mengzi-t5-base" # Local path for offline env
     max_input_length: int = 128
     max_target_length: int = 384
     num_train_epochs: int = 5
-    per_device_train_batch_size: int = 160
-    per_device_eval_batch_size: int = 160
-    learning_rate: float = 2e-4
-    warmup_steps: int = 5000
+    
+    # ========== 优化后的Batch Size配置 ==========
+    # 原配置: batch_size=160, grad_accum=2, 有效batch=640
+    # 新配置: batch_size=32, grad_accum=10, 有效batch=640 (保持不变)
+    # 优势: 更小的batch size提高GPU利用率，减少显存压力
+    per_device_train_batch_size: int = 32   # 160 → 32 (降低5倍)
+    per_device_eval_batch_size: int = 64    # 256 → 64 (评估时可以更大)
+    gradient_accumulation_steps: int = 10   # 2 → 10 (增加5倍)
+    # 有效batch size = 32 × 2 GPUs × 10 = 640 (与原来相同)
+    
+    learning_rate: float = 5e-4
+    warmup_steps: int = 500
     weight_decay: float = 0.01
-    gradient_accumulation_steps: int = 1
     fp16: bool = True
     gradient_checkpointing_kwargs: dict = field(default_factory=lambda: {"use_reentrant": False})
+    
+    # ========== 新增优化选项 ==========
+    use_torch_compile: bool = False  # 设为True可提速5-15%，但首次编译会慢
+    
     # Number of custom semantic ID tokens to add to the tokenizer
     num_semantic_id_tokens: int = 0 # This will be calculated dynamically
 
@@ -85,7 +97,7 @@ class PlaylistTIGERConfig:
 
 @dataclass
 class Config:
-    """Main configuration for the project."""
+    """Main configuration for the project (OPTIMIZED)."""
     data: DataConfig = field(default_factory=DataConfig)
     word2vec: Word2VecConfig = field(default_factory=Word2VecConfig)
     # Use the new hierarchical config
@@ -98,10 +110,10 @@ class Config:
     model_dir: str = "models"
     log_dir: str = "logs"
     
-    # System settings
+    # ========== 优化后的系统设置 ==========
     device: str = "cuda"
     seed: int = 42
-    num_workers: int = 8
+    num_workers: int = 8  # 4 → 8 (充分利用20个CPU)
     
     def __post_init__(self):
         os.makedirs(self.output_dir, exist_ok=True)

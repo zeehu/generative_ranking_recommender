@@ -167,3 +167,13 @@ JOIN
 ON rpl.glid=pl_s.special_gid
 WHERE dt = '2025-10-19'
 ```
+
+
+训练t5 v1
+{'loss': 17.3731, 'grad_norm': 81.7833480834961, 'learning_rate': 0.0, 'epoch': 0.0, 'samples_per_second': 26.990606619225513, 'hours_elapsed': 0.0026346614625718857, 'hours_remaining': 36.7640660487281}                                      
+{'loss': 12.1059, 'grad_norm': 2.2072410583496094, 'learning_rate': 2.4500000000000003e-05, 'epoch': 0.02, 'samples_per_second': 35.32285136906878, 'hours_elapsed': 0.10065879219108158, 'hours_remaining': 27.993210108339785}                 
+{'loss': 8.2389, 'grad_norm': 5.4057230949401855, 'learning_rate': 4.9500000000000004e-05, 'epoch': 0.04, 'samples_per_second': 35.5625743707896, 'hours_elapsed': 0.19996052695645225, 'hours_remaining': 27.70453100981646}                    
+{'loss': 4.345, 'grad_norm': 0.4507271647453308, 'learning_rate': 7.45e-05, 'epoch': 0.05, 'samples_per_second': 35.59509197085639, 'hours_elapsed': 0.2996667820215225, 'hours_remaining': 27.57933283871412}                                   
+{'loss': 4.0912, 'grad_norm': 1.335632085800171, 'learning_rate': 9.95e-05, 'epoch': 0.07, 'samples_per_second': 35.6627810447577, 'hours_elapsed': 0.3987973401281569, 'hours_remaining': 27.427287067313987}
+
+训练t5 v2

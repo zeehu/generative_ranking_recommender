@@ -1,5 +1,5 @@
 """
-改造后的BalanceRqKMeans核心类                                                                                                                         
+改造后的BalanceRqKMeans核心类                                                                                                                                          
 支持：
 1. 训练和预测的统一接口
 2. 单个维度的group_dims和单一均匀权重hierarchical_weights
@@ -24,7 +24,7 @@ from tqdm import tqdm
 from functools import partial
 import time
 
-from balancekmeans import KMeans, pairwise_distance_full
+from .balancekmeans import KMeans, pairwise_distance_full
 
 logger = logging.getLogger(__name__)
 
@@ -226,59 +226,111 @@ class HierarchicalRQKMeans:
         return torch.device('cpu')
     
     @staticmethod
-    def _calculate_safe_batch_size(X: torch.Tensor, device: torch.device, 
-                                   initial_batch_size: int = 500000) -> int:
+    def _calculate_safe_batch_size(X: torch.Tensor, num_centers: int, device: torch.device, 
+                                   initial_batch_size: int = 200000) -> int:
         """
         动态计算安全的batch_size，防止OOM
         
+        参考extreme版本的逻辑：
+        safe_batch = min(100000, int(0.8 * free_memory / (element_size * embedding_dim * 3)))
+        
+        关键修复：
+        1. 使用空闲内存而不是总内存
+        2. 精确计算每个样本的内存需求（distance矩阵 + mask矩阵 + 输入数据）
+        3. 根据聚类中心数量调整内存使用率
+        
         Args:
             X: 输入数据张量
+            num_centers: 聚类中心数量
             device: 计算设备
-            initial_batch_size: 初始batch_size，默认500000
+            initial_batch_size: 初始batch_size上限，默认100000
         
         Returns:
             安全的batch_size
         """
-        element_size = X.element_size()
+        # 获取GPU空闲内存
+        free_memory, total_memory = torch.cuda.mem_get_info()
         
-        if device.type == 'cuda':
-            try:
-                # 获取GPU可用内存，预留35%的安全边际（更保守）
-                available_memory = torch.cuda.mem_get_info()[0]
-                # 计算每个样本需要的内存：输入 + 距离矩阵 + 其他临时变量
-                memory_per_sample = element_size * X.shape[1] * 4  # 4倍用于距离矩阵等
-                safe_batch = int(0.65 * available_memory / memory_per_sample)
-                safe_batch = min(initial_batch_size, safe_batch)
-                logger.debug(f"GPU memory: {available_memory / 1e9:.2f}GB, safe_batch: {safe_batch:,}")
-            except Exception as e:
-                logger.warning(f"Failed to get GPU memory info: {e}, using conservative batch size")
-                safe_batch = initial_batch_size // 4
+        element_size = X.element_size()  # 通常是4 (float32)
+        embedding_dim = X.shape[1]
+        
+        # 精确计算每个样本的内存需求：
+        # 1. distance矩阵: num_centers × element_size
+        # 2. mask矩阵: num_centers × element_size
+        # 3. 输入batch数据: embedding_dim × element_size
+        # 4. 临时变量（cluster_assignments等）: 约0.5倍的distance矩阵
+        # 总计: (num_centers × 2.5 + embedding_dim) × element_size
+        memory_per_sample = (num_centers * 2.5 + embedding_dim) * element_size
+        
+        # 根据聚类中心数量调整内存使用率
+        if num_centers > 10000:
+            # 大规模聚类中心（如第2层：16384），使用60%的空闲内存
+            memory_usage_ratio = 0.6
+        elif num_centers > 5000:
+            memory_usage_ratio = 0.7
         else:
-            # CPU模式下使用更小的batch_size
-            safe_batch = initial_batch_size // 4
+            # 参考extreme版本：使用80%的空闲内存
+            memory_usage_ratio = 0.8
         
+        safe_batch = int(memory_usage_ratio * free_memory / memory_per_sample)
+        safe_batch = min(initial_batch_size, safe_batch)
         safe_batch = max(1, safe_batch)
+        
+        logger.info(
+            f"GPU memory: free={free_memory / 1e9:.2f}GB, total={total_memory / 1e9:.2f}GB, "
+            f"num_centers={num_centers:,}, embedding_dim={embedding_dim}, "
+            f"memory_per_sample={memory_per_sample / 1024:.2f}KB, "
+            f"memory_ratio={memory_usage_ratio:.1f}, safe_batch={safe_batch:,}"
+        )
+        
         return safe_batch
     
     @staticmethod
     def _calculate_adaptive_iter_limit(num_samples: int, n_clusters: int, 
-                                       layer: int, base_iter_limit: int = 100) -> int:
+                                       layer: int, base_iter_limit: int = 100,
+                                       is_sub_cluster: bool = False) -> int:
         """
         根据数据量和聚类中心数动态计算iter_limit，平衡效果和计算量
+        
+        优化：
+        1. 第2层子簇内聚类使用更少的迭代次数（数据已聚类过，更易收敛）
+        2. 提高大数据集的迭代次数
+        3. 考虑样本/聚类比例
         
         Args:
             num_samples: 当前层的样本数
             n_clusters: 当前层的聚类中心数
             layer: 层索引（0表示第1层）
             base_iter_limit: 基础迭代次数，默认100
+            is_sub_cluster: 是否是子簇内聚类（第2层特有）
         
         Returns:
             自适应的iter_limit
         """
-        # 计算样本与聚类中心的比例
         samples_per_cluster = num_samples / max(n_clusters, 1)
         
-        # 基础迭代次数调整
+        # 优化：第2层子簇内聚类的特殊处理
+        if is_sub_cluster:
+            # 子簇内聚类：数据已经过第1层聚类，分布更集中，更容易收敛
+            if num_samples < 5000:
+                iter_limit = 15
+            elif num_samples < 10000:
+                iter_limit = 20
+            elif num_samples < 20000:
+                iter_limit = 25
+            else:
+                iter_limit = 30
+            
+            # 根据样本/聚类比例微调
+            if samples_per_cluster < 50:
+                iter_limit = max(10, int(iter_limit * 0.8))  # 样本太少，减少迭代
+            elif samples_per_cluster > 200:
+                iter_limit = int(iter_limit * 1.2)  # 样本充足，稍微增加
+            
+            return max(10, iter_limit)
+        
+        # 第1层和第3层的逻辑
+        # 优化：提高大数据集的迭代次数
         if num_samples < 5000:
             iter_limit = max(10, int(base_iter_limit * 0.2))
         elif num_samples < 10000:
@@ -287,8 +339,12 @@ class HierarchicalRQKMeans:
             iter_limit = max(30, int(base_iter_limit * 0.5))
         elif num_samples < 100000:
             iter_limit = max(50, int(base_iter_limit * 0.7))
-        else:
+        elif num_samples < 500000:
             iter_limit = base_iter_limit
+        elif num_samples < 1000000:
+            iter_limit = int(base_iter_limit * 1.2)  # 新增：中大数据集
+        else:
+            iter_limit = int(base_iter_limit * 1.5)  # 新增：大数据集需要更多迭代
         
         # 根据聚类中心数调整
         if n_clusters > 512:
@@ -296,9 +352,13 @@ class HierarchicalRQKMeans:
         elif n_clusters > 256:
             iter_limit = int(iter_limit * 1.15)
         
-        # 根据层数调整（深层可以减少迭代）
+        # 优化：减缓深层衰减（从0.8改为0.9）
         if layer > 1:
-            iter_limit = max(10, int(iter_limit * 0.8))
+            iter_limit = max(10, int(iter_limit * 0.9))
+        
+        # 优化：考虑样本/聚类比例
+        if samples_per_cluster < 50:
+            iter_limit = int(iter_limit * 1.2)  # 样本太少，需要更多迭代
         
         # 确保最小迭代次数
         iter_limit = max(10, iter_limit)
@@ -379,54 +439,55 @@ class HierarchicalRQKMeans:
                     # 策略1：直接聚类（通常是第1层）
                     logger.info(f"  - Strategy: Direct clustering (Layer 0)")
                     train_start = time.time()
-                    layer_cluster_centers, layer_cluster_ids = self._train_layer_0(weighted_data, layer)
+                    layer_cluster_centers, layer_cluster_ids, layer_residual_data = self._train_layer_0(weighted_data, layer)
                     train_time = time.time() - train_start
                     logger.info(f"  - Layer 0 training completed in {train_time:.2f}s")
+                    # 更新残差数据
+                    if layer < len(self.config.layer_clusters) - 1:
+                        residual_data = layer_residual_data
                     
                 elif layer == len(self.config.layer_clusters) - 1:
                     # 策略2：最后一层（两个KMeans + match_matrix）
                     logger.info(f"  - Strategy: Last layer (2 KMeans + match matrix)")
                     train_start = time.time()
-                    layer_cluster_centers, layer_cluster_ids = self._train_last_layer(
+                    layer_cluster_centers, layer_cluster_ids, layer_residual_data = self._train_last_layer(
                         weighted_data, layer
                     )
                     train_time = time.time() - train_start
                     if len(self.match_matrices) > 0:
                         layer_match_matrix = self.match_matrices[-1]
                     logger.info(f"  - Last layer training completed in {train_time:.2f}s")
+                    # 最后一层也计算残差（虽然不会用到）
+                    if layer < len(self.config.layer_clusters) - 1:
+                        residual_data = layer_residual_data
                     
                 else:
                     # 策略3：中间层（递归聚类）
                     logger.info(f"  - Strategy: Middle layer (recursive clustering)")
                     train_start = time.time()
-                    layer_cluster_centers, layer_cluster_ids = self._train_middle_layer(
+                    layer_cluster_centers, layer_cluster_ids, layer_residual_data = self._train_middle_layer(
                         weighted_data, layer
                     )
                     train_time = time.time() - train_start
                     logger.info(f"  - Middle layer training completed in {train_time:.2f}s")
+                    # 更新残差数据
+                    if layer < len(self.config.layer_clusters) - 1:
+                        residual_data = layer_residual_data
                 
-                # 先更新内部状态（这样_compute_residuals可以访问cluster_centers_list）
+                # 更新内部状态
                 self.cluster_centers_list.append(layer_cluster_centers)
                 self.result_cluster_ids.append(layer_cluster_ids)
-                
-                # 计算残差数据用于下一层
-                residual_data = current_data
-                if layer < len(self.config.layer_clusters) - 1:
-                    residual_start = time.time()
-                    residual_data = self._compute_residuals(
-                        current_data, layer_cluster_ids, layer
-                    )
-                    residual_time = time.time() - residual_start
-                    logger.info(f"  - Computed residuals in {residual_time:.2f}s")
                 
                 # 只有当整层训练完全成功时，才保存检查点
                 if self.checkpoint_manager:
                     try:
                         checkpoint_start = time.time()
+                        # 保存checkpoint时使用residual_data（如果是最后一层则使用current_data）
+                        checkpoint_residual = residual_data if layer < len(self.config.layer_clusters) - 1 else current_data
                         self.checkpoint_manager.save_layer_checkpoint(
                             layer,
                             layer_cluster_ids,
-                            residual_data,
+                            checkpoint_residual,
                             layer_cluster_centers,
                             layer_match_matrix
                         )
@@ -436,8 +497,10 @@ class HierarchicalRQKMeans:
                         logger.error(f"Failed to save checkpoint for layer {layer}: {str(e)}")
                         raise
                 
-                # 更新当前数据为残差数据
-                current_data = residual_data
+                # 更新当前数据为残差数据（用于下一层训练）
+                if layer < len(self.config.layer_clusters) - 1:
+                    current_data = residual_data
+                    logger.info(f"  - Updated current_data to residual_data for next layer")
                 
                 # 统计本层耗时
                 layer_total_time = time.time() - layer_start_time
@@ -540,16 +603,21 @@ class HierarchicalRQKMeans:
         # 使用广播乘法，避免克隆
         return data * weight_tensor.unsqueeze(0)
     
-    def _train_layer_0(self, X: torch.Tensor, layer: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _train_layer_0(self, X: torch.Tensor, layer: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        训练第1层：直接训练n_clusters个聚类中心
+        训练第1层：直接训练n_clusters个聚类中心，并在内部计算残差
+        
+        严格按照extreme版本的逻辑：
+        1. 训练KMeans
+        2. 预测聚类ID
+        3. 使用相同的聚类ID计算残差（避免重新预测）
         
         Args:
             X: 输入数据张量，shape为(N, embedding_dim)
             layer: 层索引
         
         Returns:
-            (cluster_centers, cluster_ids): 聚类中心和聚类ID
+            (cluster_centers, cluster_ids, residual_data): 聚类中心、聚类ID和残差数据
         """
         n_clusters = self.config.layer_clusters[layer]
         
@@ -565,10 +633,6 @@ class HierarchicalRQKMeans:
         )
         logger.info(f"    - Adaptive iter_limit: {adaptive_iter_limit}")
         
-        # 动态计算安全batch_size
-        safe_batch = self._calculate_safe_batch_size(X, self.device)
-        logger.info(f"    - Safe batch_size: {safe_batch:,}")
-        
         # 创建KMeans模型
         kmeans = KMeans(n_clusters=n_clusters, device=self.device, balanced=True)
         
@@ -583,31 +647,45 @@ class HierarchicalRQKMeans:
             online=False
         )
         
-        # 获取聚类中心和ID
+        # 获取聚类中心
         cluster_centers = kmeans.cluster_centers.detach()
+        
+        # 预测聚类ID
         cluster_ids = kmeans.predict(X, balanced=False)
         if isinstance(cluster_ids, np.ndarray):
             cluster_ids = torch.from_numpy(cluster_ids).to(self.device)
+        
+        # 计算残差（使用相同的cluster_ids，避免重新预测）
+        logger.info(f"    - Computing residuals for layer {layer + 1}")
+        residual_data = self._compute_residuals_with_centers(
+            X, cluster_ids, cluster_centers
+        )
         
         # 及时释放KMeans模型
         del kmeans
         if self.device.type == 'cuda':
             torch.cuda.empty_cache()
         
-        return cluster_centers, cluster_ids
+        return cluster_centers, cluster_ids, residual_data
     
-    def _train_middle_layer(self, X: torch.Tensor, layer: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _train_middle_layer(self, X: torch.Tensor, layer: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        训练中间层：在前一层的每个簇内递归进行聚类
+        训练中间层：在前一层的每个簇内递归进行聚类，并在内部计算残差
+        
+        严格按照extreme版本的逻辑：
+        1. 递归训练KMeans（每个父簇内训练）
+        2. 重新分配聚类ID（使用未取余的ID）
+        3. 使用未取余的ID计算残差
+        4. 返回取余后的ID用于保存
         
         Args:
             X: 输入数据张量，shape为(N, embedding_dim)
             layer: 层索引
         
         Returns:
-            (kmeans_centers, cluster_ids): 合并的聚类中心和聚类ID
+            (kmeans_centers, cluster_ids, residual_data): 聚类中心、聚类ID（已取余）和残差数据
         """
-        n_clusters = self.config.layer_clusters[layer]
+        cur_need_cluster = self.config.need_clusters[layer]
         pre_need_cluster = self.config.need_clusters[layer - 1]
         
         if layer - 1 >= len(self.result_cluster_ids):
@@ -625,35 +703,33 @@ class HierarchicalRQKMeans:
                 target_nodes_num *= x
         
         logger.info(f"    - Training {pre_need_cluster} sub-clusters recursively")
+        logger.info(f"    - Each sub-cluster trains {cur_need_cluster} centers (total: {pre_need_cluster * cur_need_cluster})")
         
         # 递归聚类：在前一层的每个簇内进行聚类
         kmeans_centers_list = []
         for i in tqdm(range(pre_need_cluster), desc="    Sub-clusters", leave=False):
-            # 获取该簇的数据
             idx = torch.where(prev_cluster_ids == i)[0]
             sub_data = X[idx]
             
-            # 动态计算自适应iter_limit
+            # 优化：传入 is_sub_cluster=True，使用更少的迭代次数
             adaptive_iter_limit = self._calculate_adaptive_iter_limit(
-                len(idx), n_clusters, layer, self.config.iter_limit
+                len(idx), cur_need_cluster, layer, self.config.iter_limit,
+                is_sub_cluster=True
             )
             
-            # 为该簇训练KMeans
-            sub_kmeans = KMeans(n_clusters=n_clusters, device=self.device, balanced=True)
+            sub_kmeans = KMeans(n_clusters=cur_need_cluster, device=self.device, balanced=True)
             sub_kmeans.fit_by_min_loss(
                 X=sub_data,
                 target_nodes_num=target_nodes_num,
                 distance='euclidean',
                 iter_limit=adaptive_iter_limit,
-                tqdm_flag=False,
-                half=n_clusters >= 512,
+                tqdm_flag=True,
+                half=cur_need_cluster >= 512,
                 online=False
             )
             
-            # 优化：使用detach()断开计算图，避免保留历史记录
             kmeans_centers_list.append(sub_kmeans.cluster_centers.detach())
             
-            # 关键：及时释放显存，避免累积
             del sub_kmeans, sub_data, idx
             if self.device.type == 'cuda':
                 torch.cuda.empty_cache()
@@ -664,22 +740,34 @@ class HierarchicalRQKMeans:
         if self.device.type == 'cuda':
             torch.cuda.empty_cache()
         
-        logger.info(f"    - Reassigning clusters for layer {layer + 1}")
-        # 重新分配聚类ID（返回值已是torch.Tensor）
-        cluster_ids = self._reassign_clusters_middle_layer(X, kmeans_centers, prev_cluster_ids, layer)
+        logger.info(f"    - Reassigning clusters and computing residuals for layer {layer + 1}")
+        # 重新分配聚类ID并计算残差（返回未取余的ID和残差）
+        cluster_ids_raw, residual_data = self._reassign_clusters_middle_layer_with_residuals(
+            X, kmeans_centers, prev_cluster_ids, layer
+        )
         
-        return kmeans_centers, cluster_ids
+        # 取余得到最终的聚类ID
+        cluster_ids = cluster_ids_raw % cur_need_cluster
+        
+        return kmeans_centers, cluster_ids, residual_data
     
-    def _train_last_layer(self, X: torch.Tensor, layer: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _train_last_layer(self, X: torch.Tensor, layer: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        训练最后一层：使用两个KMeans模型，通过match_matrix筛选最优聚类
+        训练最后一层：使用两个KMeans模型，通过match_matrix筛选最优聚类，并在内部计算残差
+        
+        严格按照extreme版本的逻辑：
+        1. 训练2个KMeans模型并合并
+        2. 生成match_matrix
+        3. 重新分配聚类ID（使用未映射的ID）
+        4. 使用未映射的ID计算残差
+        5. 映射ID到最终范围
         
         Args:
             X: 输入数据张量，shape为(N, embedding_dim)
             layer: 层索引
         
         Returns:
-            (cluster_centers, cluster_ids): 合并的聚类中心和聚类ID
+            (cluster_centers, cluster_ids, residual_data): 聚类中心、聚类ID（已映射）和残差数据
         """
         n_clusters = self.config.layer_clusters[layer]
         need_clusters = self.config.need_clusters[layer]
@@ -690,17 +778,16 @@ class HierarchicalRQKMeans:
                 f"Expected at least 2 layers but only have {len(self.result_cluster_ids)} layers."
             )
         
-        # 动态计算自适应iter_limit（最后一层通常需要较少迭代）
-        adaptive_iter_limit = max(10, int(self._calculate_adaptive_iter_limit(
-            len(X), n_clusters, layer, self.config.iter_limit
-        ) * 0.6))
+        # 优化：最后一层不要过度降低iter_limit（从0.6改为0.85）
+        # 第3层处理残差数据，分布最分散，收敛最困难，需要更多迭代
+        # 第3层只需要把把数据打散即可，不需要充分迭代
+        #adaptive_iter_limit = max(20, int(self._calculate_adaptive_iter_limit(
+        #    len(X), n_clusters, layer, self.config.iter_limit
+        #) * 0.85))
+        adaptive_iter_limit = 20
         logger.info(f"    - Adaptive iter_limit: {adaptive_iter_limit}")
         
-        # 动态计算安全batch_size
-        safe_batch = self._calculate_safe_batch_size(X, self.device)
-        logger.info(f"    - Safe batch_size: {safe_batch:,}")
-        
-        # 训练两个KMeans模型，只保存聚类中心
+        # 训练两个KMeans模型
         kmeans_centers_list = []
         for part in tqdm(range(2), desc="    KMeans models", leave=False):
             kmeans = KMeans(n_clusters=n_clusters, device=self.device, balanced=True)
@@ -712,7 +799,6 @@ class HierarchicalRQKMeans:
                 half=n_clusters >= 512,
                 online=False
             )
-            # 优化：只保存聚类中心，不保存整个模型
             kmeans_centers_list.append(kmeans.cluster_centers.detach())
             del kmeans
             if self.device.type == 'cuda':
@@ -734,28 +820,39 @@ class HierarchicalRQKMeans:
         )
         self.match_matrices.append(match_matrix)
         
-        # 重新分配聚类ID
+        # 计算组合ID
         before_cluster_ids = prev_prev_cluster_ids * prev_prev_need_cluster + prev_cluster_ids
         
-        cluster_ids = self._reassign_clusters_last_layer(
+        logger.info(f"    - Reassigning clusters and computing residuals for layer {layer + 1}")
+        # 重新分配聚类ID并计算残差（使用未映射的ID）
+        cluster_ids_raw, residual_data = self._reassign_clusters_last_layer_with_residuals(
             X, cur_kmeans_centers, before_cluster_ids, match_matrix, layer
         )
         
-        return cur_kmeans_centers, cluster_ids
+        # 映射到最终的聚类ID
+        cluster_ids = self._merge_match_matrix_cluster_ids(
+            match_matrix, cluster_ids_raw, before_cluster_ids
+        )
+        
+        return cur_kmeans_centers, cluster_ids, residual_data
     
-    def _reassign_clusters_middle_layer(self, X: torch.Tensor, kmeans_centers: torch.Tensor,
-                                       prev_cluster_ids: torch.Tensor, layer: int) -> torch.Tensor:
+    def _reassign_clusters_middle_layer_with_residuals(self, X: torch.Tensor, kmeans_centers: torch.Tensor,
+                                                       prev_cluster_ids: torch.Tensor, layer: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        重新分配中间层的聚类ID，确保每个样本分配到前一层对应簇内的聚类中心
+        重新分配中间层的聚类ID并计算残差，严格按照extreme版本的逻辑
+        
+        关键：
+        1. 使用未取余的cluster_ids计算残差
+        2. 返回未取余的cluster_ids和残差数据
         
         Args:
             X: 输入数据张量
-            kmeans_centers: 合并的聚类中心
+            kmeans_centers: 合并的聚类中心 [pre_need_cluster * cur_need_cluster, dim]
             prev_cluster_ids: 前一层的聚类ID
             layer: 层索引
         
         Returns:
-            重新分配后的聚类ID
+            (cluster_ids_raw, residual_data): 未取余的聚类ID和残差数据
         """
         pre_need_cluster = self.config.need_clusters[layer - 1]
         cur_need_cluster = self.config.need_clusters[layer]
@@ -764,9 +861,10 @@ class HierarchicalRQKMeans:
         if prev_cluster_ids.dtype != torch.long:
             prev_cluster_ids = prev_cluster_ids.long()
         
-        # 动态计算安全batch_size
-        safe_batch = self._calculate_safe_batch_size(X, self.device)
-        logger.info(f"    - Safe batch_size: {safe_batch:,}")
+        # 中间层的聚类中心数量 = pre_need_cluster × cur_need_cluster
+        num_centers = len(kmeans_centers)
+        safe_batch = self._calculate_safe_batch_size(X, num_centers, self.device)
+        logger.info(f"    - Safe batch_size: {safe_batch:,} (num_centers: {num_centers:,})")
         
         cluster_ids = []
         for i in tqdm(range(0, len(X), safe_batch), total=(len(X) + safe_batch - 1) // safe_batch, 
@@ -777,18 +875,16 @@ class HierarchicalRQKMeans:
             # 计算距离
             distance = pairwise_distance_full(batch, kmeans_centers, device=self.device)
             
-            # 优化：不创建完整的one-hot矩阵，直接创建掩码
-            # 创建掩码：只有对应簇的位置为1
+            # 创建掩码
             mask = torch.zeros_like(distance)
             for cluster_idx in range(pre_need_cluster):
                 cluster_mask = (batch_cluster_ids == cluster_idx)
                 if cluster_mask.any():
-                    # 只为该簇的样本设置对应的聚类中心位置
                     start_idx = cluster_idx * cur_need_cluster
                     end_idx = start_idx + cur_need_cluster
                     mask[cluster_mask, start_idx:end_idx] = 1.0
             
-            # 原地操作，避免创建新矩阵
+            # 原地操作
             distance.add_(10000.0 * (1 - mask))
             
             cluster_assignments = torch.argmin(distance, dim=1)
@@ -798,34 +894,41 @@ class HierarchicalRQKMeans:
             if self.device.type == 'cuda':
                 torch.cuda.empty_cache()
         
-        cluster_ids = torch.cat(cluster_ids)
+        cluster_ids_raw = torch.cat(cluster_ids)
         
-        # 通过模运算将ID重新映射到[0, need_clusters[layer]-1]
-        cluster_ids = cluster_ids % cur_need_cluster
+        # 计算残差（使用未取余的cluster_ids_raw）
+        logger.info(f"    - Computing residuals with raw cluster IDs (range: 0-{len(kmeans_centers)-1})")
+        residual_data = self._compute_residuals_with_centers(X, cluster_ids_raw, kmeans_centers)
         
-        return cluster_ids
+        # 返回未取余的cluster_ids和残差
+        return cluster_ids_raw, residual_data
     
-    def _reassign_clusters_last_layer(self, X: torch.Tensor, kmeans_centers: torch.Tensor,
-                                     before_cluster_ids: np.ndarray, match_matrix: List,
-                                     layer: int) -> torch.Tensor:
+    def _reassign_clusters_last_layer_with_residuals(self, X: torch.Tensor, kmeans_centers: torch.Tensor,
+                                                     before_cluster_ids: np.ndarray, match_matrix: List,
+                                                     layer: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        重新分配最后一层的聚类ID，使用match_matrix约束
+        重新分配最后一层的聚类ID并计算残差，严格按照extreme版本的逻辑
+        
+        关键：
+        1. 使用未映射的cluster_ids计算残差
+        2. 返回未映射的cluster_ids和残差数据
         
         Args:
             X: 输入数据张量
-            kmeans_centers: 合并的聚类中心
+            kmeans_centers: 合并的聚类中心 [2 * n_clusters, dim]
             before_cluster_ids: 前两层的组合聚类ID
             match_matrix: 匹配矩阵，指定哪些聚类中心可用
             layer: 层索引
         
         Returns:
-            重新分配后的聚类ID
+            (cluster_ids_raw, residual_data): 未映射的聚类ID和残差数据
         """
-        # 动态计算安全batch_size
-        safe_batch = self._calculate_safe_batch_size(X, self.device)
-        logger.info(f"    - Safe batch_size: {safe_batch:,}")
+        # 最后一层的聚类中心数量 = 2 × n_clusters
+        num_centers = len(kmeans_centers)
+        safe_batch = self._calculate_safe_batch_size(X, num_centers, self.device)
+        logger.info(f"    - Safe batch_size: {safe_batch:,} (num_centers: {num_centers:,})")
         
-        # 优化：保持match_matrix在CPU，避免占用显存
+        # 保持match_matrix在CPU
         match_matrix_np = np.array(match_matrix, dtype=np.float32)
         
         cluster_ids = []
@@ -838,12 +941,12 @@ class HierarchicalRQKMeans:
             # 计算距离
             distance = pairwise_distance_full(batch, kmeans_centers, device=self.device)
             
-            # 优化：从CPU match_matrix中索引，然后转移到GPU
+            # 从CPU match_matrix中索引
             match_matrix_batch = torch.from_numpy(
                 match_matrix_np[batch_before_ids]
             ).float().to(self.device)
             
-            # 原地操作，避免创建新矩阵
+            # 原地操作
             distance.add_(10000.0 * (1 - match_matrix_batch))
             
             cluster_assignments = torch.argmin(distance, dim=1)
@@ -853,14 +956,14 @@ class HierarchicalRQKMeans:
             if self.device.type == 'cuda':
                 torch.cuda.empty_cache()
         
-        cluster_ids = torch.cat(cluster_ids)
+        cluster_ids_raw = torch.cat(cluster_ids)
         
-        # 通过match_matrix映射到最终的聚类ID
-        final_cluster_ids = self._merge_match_matrix_cluster_ids(
-            match_matrix, cluster_ids, before_cluster_ids
-        )
+        # 计算残差（使用未映射的cluster_ids_raw）
+        logger.info(f"    - Computing residuals with raw cluster IDs (range: 0-{len(kmeans_centers)-1})")
+        residual_data = self._compute_residuals_with_centers(X, cluster_ids_raw, kmeans_centers)
         
-        return final_cluster_ids
+        # 返回未映射的cluster_ids和残差
+        return cluster_ids_raw, residual_data
     
     def _assign_last_match_matrix(self, cur_kmeans_centers: torch.Tensor, cur_n_cluster: int,
                                  X: torch.Tensor, prev_prev_need_cluster: int,
@@ -911,7 +1014,7 @@ class HierarchicalRQKMeans:
                         len(sub_data), cur_need_cluster, layer, base_iter_limit=20
                     )
                     _ = sub_kmeans.fit(X=sub_data.to(self.device), distance='euclidean',
-                                      iter_limit=adaptive_iter, tqdm_flag=False, half=False, online=False)
+                                      iter_limit=adaptive_iter, tqdm_flag=True, half=False, online=False)
                     sub_centers = sub_kmeans.cluster_centers.cpu().numpy()
                 
                 # 优化：使用向量化操作计算距离，避免嵌套循环
@@ -982,10 +1085,52 @@ class HierarchicalRQKMeans:
         
         return torch.tensor(result_cluster_ids, device=self.device)
     
+    def _compute_residuals_with_centers(self, X: torch.Tensor, cluster_ids: torch.Tensor,
+                                        cluster_centers: torch.Tensor) -> torch.Tensor:
+        """
+        使用给定的聚类中心计算残差数据，残差 = 原始数据 - 聚类中心，然后按维度分组归一化
+        
+        这个函数用于在训练时计算残差，直接使用传入的聚类中心，避免从列表中索引
+        
+        Args:
+            X: 输入数据张量
+            cluster_ids: 当前层的聚类ID
+            cluster_centers: 聚类中心张量
+        
+        Returns:
+            归一化后的残差数据
+        """
+        # 确保cluster_ids为long类型
+        if cluster_ids.dtype != torch.long:
+            cluster_ids = cluster_ids.long()
+        
+        # 确保在同一设备上
+        cluster_centers = cluster_centers.to(X.device)
+        
+        # 获取每个样本对应的聚类中心
+        assigned_centers = cluster_centers[cluster_ids]
+        
+        # 计算残差
+        residuals = X - assigned_centers
+        
+        # 按维度分组归一化（原地操作）
+        cur_idx = 0
+        for dim in self.config.group_dims:
+            group_residuals = residuals[:, cur_idx:cur_idx+dim]
+            norms = torch.norm(group_residuals, dim=1, keepdim=True) + 1e-8
+            residuals[:, cur_idx:cur_idx+dim].div_(norms)
+            cur_idx += dim
+        
+        del assigned_centers
+        if X.device.type == 'cuda':
+            torch.cuda.empty_cache()
+        
+        return residuals
+    
     def _compute_residuals(self, X: torch.Tensor, cluster_ids: torch.Tensor,
                           layer: int) -> torch.Tensor:
         """
-        计算残差数据用于下一层训练，残差 = 原始数据 - 聚类中心，然后按维度分组归一化
+        计算残差数据用于下一层训练（用于预测阶段）
         
         Args:
             X: 输入数据张量
@@ -996,33 +1141,7 @@ class HierarchicalRQKMeans:
             归一化后的残差数据
         """
         kmeans_centers = self.cluster_centers_list[layer]
-        
-        # 确保cluster_ids为long类型
-        if cluster_ids.dtype != torch.long:
-            cluster_ids = cluster_ids.long()
-        
-        # 确保在同一设备上
-        kmeans_centers = kmeans_centers.to(X.device)
-        
-        # 获取每个样本对应的聚类中心
-        assigned_centers = kmeans_centers[cluster_ids]
-        
-        # 优化：直接计算残差，不克隆
-        residuals = X - assigned_centers
-        
-        # 按维度分组归一化（原地操作）
-        cur_idx = 0
-        for dim in self.config.group_dims:
-            group_residuals = residuals[:, cur_idx:cur_idx+dim]
-            norms = torch.norm(group_residuals, dim=1, keepdim=True) + 1e-8
-            residuals[:, cur_idx:cur_idx+dim].div_(norms)  # 原地除法
-            cur_idx += dim
-        
-        del assigned_centers, kmeans_centers
-        if X.device.type == 'cuda':
-            torch.cuda.empty_cache()
-        
-        return residuals
+        return self._compute_residuals_with_centers(X, cluster_ids, kmeans_centers)
     
     def _predict_layer_0(self, X: torch.Tensor, layer: int) -> torch.Tensor:
         """
@@ -1036,7 +1155,8 @@ class HierarchicalRQKMeans:
             聚类ID
         """
         kmeans_centers = self.cluster_centers_list[layer]
-        safe_batch = self._calculate_safe_batch_size(X, self.device)
+        num_centers = len(kmeans_centers)
+        safe_batch = self._calculate_safe_batch_size(X, num_centers, self.device)
         
         cluster_ids = []
         for i in tqdm(range(0, len(X), safe_batch), total=(len(X) + safe_batch - 1) // safe_batch,
@@ -1074,7 +1194,8 @@ class HierarchicalRQKMeans:
             prev_cluster_ids = prev_cluster_ids.long()
         
         # 动态计算安全batch_size
-        safe_batch = self._calculate_safe_batch_size(X, self.device)
+        num_centers = len(kmeans_centers)
+        safe_batch = self._calculate_safe_batch_size(X, num_centers, self.device)
         
         cluster_ids = []
         for i in tqdm(range(0, len(X), safe_batch), total=(len(X) + safe_batch - 1) // safe_batch,
@@ -1135,7 +1256,8 @@ class HierarchicalRQKMeans:
         before_cluster_ids = prev_prev_cluster_ids * prev_prev_need_cluster + prev_cluster_ids
         
         # 动态计算安全batch_size
-        safe_batch = self._calculate_safe_batch_size(X, self.device)
+        num_centers = len(cur_kmeans_centers)
+        safe_batch = self._calculate_safe_batch_size(X, num_centers, self.device)
         
         # 优化：保持match_matrix在CPU，避免占用显存
         match_matrix_np = None
