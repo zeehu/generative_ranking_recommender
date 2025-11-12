@@ -61,7 +61,7 @@ class Word2VecConfig:
 # Pre-configured settings for different dataset sizes
 H_RQ_KMEANS_PROD = HierarchicalRQKMeansConfig(
     layer_clusters=[128, 1280, 1280],
-    need_clusters=[128, 128, 128],
+    need_clusters=[128, 128, 256],
     embedding_dim=512,
     group_dims=[512],  # 如果没有特殊分组，使用单个维度
     hierarchical_weights=[[1.0], [1.0], [1.0]],  # 如果没有特殊权重，使用均匀权重
