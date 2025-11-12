@@ -1,6 +1,29 @@
 """
-T5歌单生成模型推理脚本
+T5歌单生成模型推理脚本    
 用于加载训练好的T5模型并根据输入文本生成歌曲推荐
+
+支持两种模型加载方式:
+1. 从训练检查点加载 (checkpoint目录)
+   - 包含文件: config.json, model.safetensors, generation_config.json等
+   - 自动检测并加载检查点
+   
+2. 从最终保存的模型加载 (final_model目录)
+   - 使用 TIGERModel.save_pretrained() 保存的模型
+   - 包含完整的模型配置和权重
+
+使用示例:
+---------
+1. 从检查点加载并进入交互模式:
+   python src/generator/inference_t5.py --model_path models/generator/checkpoint-1000
+
+2. 从最终模型加载并生成单个歌单:
+   python src/generator/inference_t5.py --model_path models/generator/final_model --prompt "适合运动的歌曲"
+
+3. 调整生成参数:
+   python src/generator/inference_t5.py --model_path models/generator/checkpoint-1000 --max_songs 30 --temperature 1.0
+
+4. 启用调试日志:
+   python src/generator/inference_t5.py --model_path models/generator/checkpoint-1000 --log_level DEBUG
 """
 import os
 import sys
@@ -17,7 +40,7 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-from config import Config
+from config_optimized import Config
 from src.generator.tiger_model import TIGERModel
 from src.common.utils import setup_logging
 
@@ -51,20 +74,22 @@ class PlaylistGenerator:
     def _load_model(self) -> TIGERModel:
         """
         智能加载TIGER模型。
+        - 如果是检查点目录（包含model.safetensors），则从检查点加载。
         - 如果是最终模型目录，则使用 TIGERModel.from_pretrained。
-        - 如果是检查点目录，则通过 TIGERModel.__init__ 加载。
         """
         if not os.path.exists(self.model_path):
-            logger.error(f"错误: 模型未找到 {self.model_path}")
+            logger.error(f"错误: 模型路径不存在 {self.model_path}")
             logger.error("请确保路径正确")
             sys.exit(1)
 
-        # 判断是否为检查点目录
-        is_checkpoint = "checkpoint" in os.path.basename(os.path.normpath(self.model_path))
+        # 检查目录中的关键文件以判断模型类型
+        is_checkpoint = self._is_checkpoint_dir(self.model_path)
 
         try:
             if is_checkpoint:
-                logger.info(f"检测到检查点目录，使用 __init__ 方法加载: {self.model_path}")
+                logger.info(f"检测到检查点目录，正在加载: {self.model_path}")
+                logger.info(f"检查点包含文件: {os.listdir(self.model_path)}")
+                
                 # 从主配置重新构建 layer_vocab_sizes
                 rq_config = self.config.h_rqkmeans
                 layer_vocab_sizes = {
@@ -72,25 +97,171 @@ class PlaylistGenerator:
                     'l2': rq_config.need_clusters[1],
                     'l3': rq_config.need_clusters[2],
                 }
-                # 直接实例化TIGERModel。这将从检查点加载基础T5模型，
-                # 然后重新应用自定义token和嵌入层大小调整。
-                model = TIGERModel(base_model=self.model_path, layer_vocab_sizes=layer_vocab_sizes)
+                logger.info(f"使用层级词汇表大小: {layer_vocab_sizes}")
+                
+                # 检查checkpoint是否包含tokenizer文件
+                has_tokenizer = self._has_tokenizer_files(self.model_path)
+                
+                if not has_tokenizer:
+                    logger.warning("检查点目录缺少tokenizer文件（spiece.model等）")
+                    logger.info(f"将使用基础模型路径加载tokenizer: {self.config.generator_t5.model_name}")
+                    # 使用修改后的加载方式
+                    model = self._load_from_checkpoint_without_tokenizer(
+                        self.model_path, 
+                        self.config.generator_t5.model_name,
+                        layer_vocab_sizes
+                    )
+                else:
+                    # 直接实例化TIGERModel，这将从检查点加载基础T5模型
+                    # 然后重新应用自定义token和嵌入层大小调整
+                    model = TIGERModel(base_model=self.model_path, layer_vocab_sizes=layer_vocab_sizes)
+                
+                logger.info("检查点加载成功")
             else:
                 logger.info(f"正在从 {self.model_path} 加载最终模型 (使用 from_pretrained)...")
                 # 对最终保存的模型使用自定义的 from_pretrained 方法
                 model = TIGERModel.from_pretrained(self.model_path)
+                logger.info("最终模型加载成功")
             
             model.model.to(self.device)
             model.model.eval()
-            logger.info(f"模型加载成功。词汇表大小: {len(model.tokenizer)}")
+            logger.info(f"模型已移至设备 {self.device} 并设置为评估模式")
+            logger.info(f"词汇表大小: {len(model.tokenizer)}")
             return model
         except Exception as e:
             logger.error(f"模型加载失败: {e}", exc_info=True)
             if is_checkpoint:
-                logger.error("加载检查点失败。请确保检查点目录完整，并且Hugging Face模型文件存在。")
+                logger.error("加载检查点失败。可能的原因:")
+                logger.error("  1. 缺少必需文件: config.json, model.safetensors")
+                logger.error("  2. 缺少tokenizer文件: spiece.model, tokenizer.json等")
+                logger.error("  3. protobuf库未安装: pip install protobuf sentencepiece")
+                logger.error(f"\n请检查检查点目录: {self.model_path}")
             else:
                 logger.error("加载最终模型失败。请确保模型是使用 TIGERModel.save_pretrained 保存的。")
             sys.exit(1)
+    
+    def _has_tokenizer_files(self, path: str) -> bool:
+        """
+        检查目录是否包含tokenizer文件。
+        
+        Args:
+            path: 要检查的目录路径
+            
+        Returns:
+            如果包含tokenizer文件返回True，否则返回False
+        """
+        if not os.path.isdir(path):
+            return False
+        
+        files = os.listdir(path)
+        
+        # T5 tokenizer需要的文件
+        tokenizer_files = [
+            'spiece.model',           # SentencePiece模型文件（必需）
+            'tokenizer.json',         # 或者tokenizer配置
+            'tokenizer_config.json',  # tokenizer配置
+        ]
+        
+        # 至少需要spiece.model
+        has_spiece = 'spiece.model' in files
+        
+        if has_spiece:
+            logger.debug(f"目录 {path} 包含tokenizer文件")
+        else:
+            logger.debug(f"目录 {path} 缺少tokenizer文件")
+        
+        return has_spiece
+    
+    def _load_from_checkpoint_without_tokenizer(self, checkpoint_path: str, 
+                                                base_model_path: str,
+                                                layer_vocab_sizes: dict) -> TIGERModel:
+        """
+        从缺少tokenizer文件的checkpoint加载模型。
+        使用基础模型的tokenizer，然后加载checkpoint的权重。
+        
+        Args:
+            checkpoint_path: checkpoint目录路径
+            base_model_path: 基础模型路径（用于加载tokenizer）
+            layer_vocab_sizes: 层级词汇表大小
+            
+        Returns:
+            加载好的TIGERModel
+        """
+        from transformers import T5ForConditionalGeneration
+        from src.generator.tiger_model import TIGERTokenizer
+        
+        logger.info(f"从基础模型加载tokenizer: {base_model_path}")
+        
+        # 创建TIGER模型实例，使用基础模型的tokenizer
+        tiger_model = TIGERModel.__new__(TIGERModel)
+        super(TIGERModel, tiger_model).__init__()
+        
+        # 初始化tokenizer（从基础模型）
+        tiger_model.tokenizer = TIGERTokenizer(base_model_path, layer_vocab_sizes)
+        tiger_model.layer_vocab_sizes = layer_vocab_sizes
+        tiger_model.base_model_path = base_model_path
+        
+        # 从checkpoint加载T5模型
+        logger.info(f"从checkpoint加载模型权重: {checkpoint_path}")
+        tiger_model.model = T5ForConditionalGeneration.from_pretrained(checkpoint_path)
+        tiger_model.config = tiger_model.model.config
+        
+        # 验证词汇表大小
+        expected_vocab_size = len(tiger_model.tokenizer)
+        actual_vocab_size = tiger_model.model.config.vocab_size
+        
+        if actual_vocab_size != expected_vocab_size:
+            logger.warning(
+                f"词汇表大小不匹配: 模型={actual_vocab_size}, tokenizer={expected_vocab_size}"
+            )
+            logger.info("调整模型嵌入层大小以匹配tokenizer...")
+            tiger_model.model.resize_token_embeddings(expected_vocab_size)
+        
+        logger.info(f"成功加载checkpoint，词汇表大小: {len(tiger_model.tokenizer)}")
+        
+        return tiger_model
+    
+    def _is_checkpoint_dir(self, path: str) -> bool:
+        """
+        判断给定路径是否为训练检查点目录。
+        检查点目录通常包含: model.safetensors, config.json, optimizer.pt, scheduler.pt 等。
+        
+        Args:
+            path: 要检查的目录路径
+            
+        Returns:
+            如果是检查点目录返回True，否则返回False
+        """
+        if not os.path.isdir(path):
+            return False
+        
+        files = os.listdir(path)
+        
+        # 检查点目录的特征文件
+        checkpoint_indicators = [
+            'model.safetensors',      # Hugging Face safetensors格式
+            'pytorch_model.bin',      # 或传统的PyTorch格式
+            'optimizer.pt',           # 优化器状态
+            'scheduler.pt',           # 调度器状态
+            'trainer_state.json',     # 训练器状态
+        ]
+        
+        # 如果包含任何检查点特征文件，则认为是检查点目录
+        has_checkpoint_files = any(f in files for f in checkpoint_indicators)
+        
+        # 同时检查是否包含必需的模型配置文件
+        has_config = 'config.json' in files
+        
+        # 检查是否包含模型权重文件
+        has_model_weights = 'model.safetensors' in files or 'pytorch_model.bin' in files
+        
+        is_checkpoint = has_checkpoint_files and has_config and has_model_weights
+        
+        if is_checkpoint:
+            logger.debug(f"目录 {path} 被识别为检查点目录")
+            logger.debug(f"包含文件: {files}")
+        
+        return is_checkpoint
 
     def _create_reverse_map(self) -> Dict[Tuple[int, ...], List[str]]:
         """创建从语义ID到歌曲ID列表的反向映射"""
@@ -125,7 +296,7 @@ class PlaylistGenerator:
             logger.warning(f"歌曲信息文件未找到: {self.config.data.song_info_file}")
         return mapping
 
-    def generate(self, title: str, tags: str = "", max_songs: int = 20, temperature: float = 0.8) -> List[str]:
+    def generate(self, title: str, tags: str = "", max_songs: int = 20, temperature: float = 0.8) -> List[Dict]:
         """
         根据标题和标签生成歌单
         
@@ -136,7 +307,10 @@ class PlaylistGenerator:
             temperature: 采样温度（越高越多样化）
             
         Returns:
-            歌曲ID列表
+            歌曲信息字典列表，每个字典包含:
+            - song_id: 歌曲ID
+            - semantic_id: 语义ID元组
+            - cluster_songs: 簇中的所有歌曲ID列表
         """
         # 格式化输入提示以匹配训练格式
         prompt = title
@@ -207,23 +381,30 @@ class PlaylistGenerator:
         unique_semantic_ids = list(dict.fromkeys(semantic_id_tuples))
         logger.info(f"唯一语义ID: {len(unique_semantic_ids)}")
 
-        # 对每个唯一的语义ID，从其簇中随机采样一首歌
-        reconstructed_song_ids = []
+        # 对每个唯一的语义ID，从其簇中随机采样一首歌，并保存完整信息
+        reconstructed_songs = []
         for id_tuple in unique_semantic_ids:
             if id_tuple in self.semantic_to_song_cluster:
                 song_cluster = self.semantic_to_song_cluster[id_tuple]
                 # 从簇中随机采样一首歌
                 sampled_song = random.choice(song_cluster)
-                reconstructed_song_ids.append(sampled_song)
+                
+                # 保存歌曲信息
+                song_info = {
+                    'song_id': sampled_song,
+                    'semantic_id': id_tuple,
+                    'cluster_songs': song_cluster
+                }
+                reconstructed_songs.append(song_info)
                 
                 # 如果达到最大歌曲数则停止
-                if len(reconstructed_song_ids) >= max_songs:
+                if len(reconstructed_songs) >= max_songs:
                     break
             else:
                 logger.debug(f"语义ID {id_tuple} 在簇映射中未找到")
         
-        logger.info(f"生成了 {len(reconstructed_song_ids)} 首歌曲")
-        return reconstructed_song_ids
+        logger.info(f"生成了 {len(reconstructed_songs)} 首歌曲")
+        return reconstructed_songs
 
     def interactive_demo(self):
         """启动交互式命令行演示"""
@@ -250,22 +431,46 @@ class PlaylistGenerator:
                     continue
 
                 print("\n🎼 生成中，请稍候...")
-                song_ids = self.generate(prompt.strip())
+                songs = self.generate(prompt.strip())
 
-                if not song_ids:
+                if not songs:
                     print("❌ 模型未能生成有效的歌曲列表，请尝试更换标题或描述。")
                     continue
                 
-                print(f"\n✨ 为您推荐的歌单 (共{len(song_ids)}首): ✨")
-                print("-"*60)
-                for i, song_id in enumerate(song_ids, 1):
+                print(f"\n✨ 为您推荐的歌单 (共{len(songs)}首): ✨")
+                print("="*100)
+                
+                for i, song_data in enumerate(songs, 1):
+                    song_id = song_data['song_id']
+                    sem_id = song_data['semantic_id']
+                    cluster_songs = song_data['cluster_songs']
+                    
                     info = self.song_info_map.get(song_id, {"name": "未知歌曲", "singer": "未知歌手"})
-                    sem_id = self._get_sem_id_for_song(song_id)
-                    cluster_size = len(self.semantic_to_song_cluster.get(sem_id, [])) if sem_id else 0
-                    print(f"  {i:2d}. {info['name']} - {info['singer']}")
-                    if cluster_size > 1:
-                        print(f"      (来自包含{cluster_size}首相似歌曲的簇)")
-                print("-"*60)
+                    
+                    # 构建主歌曲信息（紧凑格式）
+                    main_song = f"{i:2d}. {info['name']} - {info['singer']} - {song_id} - {sem_id[0]}, {sem_id[1]}, {sem_id[2]}"
+                    
+                    # 如果簇中有多首歌曲，添加簇信息（最多显示4首其他歌曲）
+                    if len(cluster_songs) > 1:
+                        other_songs = [s for s in cluster_songs if s != song_id]
+                        cluster_info_parts = []
+                        
+                        for other_song_id in other_songs[:4]:
+                            other_info = self.song_info_map.get(other_song_id, {"name": "未知", "singer": "未知"})
+                            # 获取该歌曲的语义ID（应该和主歌曲相同）
+                            cluster_info_parts.append(f"{other_info['name']} - {other_info['singer']} - {other_song_id}")
+                        
+                        if cluster_info_parts:
+                            cluster_str = "; ".join(cluster_info_parts)
+                            if len(other_songs) > 4:
+                                cluster_str += f"; ... 还有{len(other_songs)-4}首"
+                            print(f"{main_song} ({cluster_str})")
+                        else:
+                            print(main_song)
+                    else:
+                        print(main_song)
+                
+                print("="*100)
 
             except KeyboardInterrupt:
                 print("\n\n感谢使用，再见！👋")
@@ -335,19 +540,47 @@ if __name__ == "__main__":
     if args.prompt:
         # 单次生成模式
         logger.info(f"正在为以下内容生成歌单: '{args.prompt}'")
-        song_ids = generator.generate(
+        songs = generator.generate(
             args.prompt, 
             max_songs=args.max_songs,
             temperature=args.temperature
         )
         
-        if song_ids:
-            print(f"\n生成的歌单 (共{len(song_ids)}首):")
-            print("="*60)
-            for i, song_id in enumerate(song_ids, 1):
+        if songs:
+            print(f"\n生成的歌单 (共{len(songs)}首):")
+            print("="*100)
+            
+            for i, song_data in enumerate(songs, 1):
+                song_id = song_data['song_id']
+                sem_id = song_data['semantic_id']
+                cluster_songs = song_data['cluster_songs']
+                
                 info = generator.song_info_map.get(song_id, {"name": "未知歌曲", "singer": "未知歌手"})
-                print(f"{i:2d}. {info['name']} - {info['singer']}")
-            print("="*60)
+                
+                # 构建主歌曲信息（紧凑格式）
+                main_song = f"{i:2d}. {info['name']} - {info['singer']} - {song_id} - {sem_id[0]}, {sem_id[1]}, {sem_id[2]}"
+                
+                # 如果簇中有多首歌曲，添加簇信息（最多显示4首其他歌曲）
+                if len(cluster_songs) > 1:
+                    other_songs = [s for s in cluster_songs if s != song_id]
+                    cluster_info_parts = []
+                    
+                    for other_song_id in other_songs[:4]:
+                        other_info = generator.song_info_map.get(other_song_id, {"name": "未知", "singer": "未知"})
+                        # 获取该歌曲的语义ID（应该和主歌曲相同）
+                        cluster_info_parts.append(f"{other_info['name']} - {other_info['singer']} - {other_song_id}")
+                    
+                    if cluster_info_parts:
+                        cluster_str = "; ".join(cluster_info_parts)
+                        if len(other_songs) > 4:
+                            cluster_str += f"; ... 还有{len(other_songs)-4}首"
+                        print(f"{main_song} ({cluster_str})")
+                    else:
+                        print(main_song)
+                else:
+                    print(main_song)
+            
+            print("="*100)
         else:
             print("未能生成有效的歌单，请尝试其他提示文本。")
     else:
