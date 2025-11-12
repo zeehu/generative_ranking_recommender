@@ -49,21 +49,47 @@ class PlaylistGenerator:
         self.song_info_map = self._load_song_info()
 
     def _load_model(self) -> TIGERModel:
-        """加载训练好的TIGER模型"""
+        """
+        智能加载TIGER模型。
+        - 如果是最终模型目录，则使用 TIGERModel.from_pretrained。
+        - 如果是检查点目录，则通过 TIGERModel.__init__ 加载。
+        """
         if not os.path.exists(self.model_path):
             logger.error(f"错误: 模型未找到 {self.model_path}")
-            logger.error("请确保已使用 train_t5.py 训练模型")
+            logger.error("请确保路径正确")
             sys.exit(1)
-        
-        logger.info(f"正在从 {self.model_path} 加载TIGER模型...")
+
+        # 判断是否为检查点目录
+        is_checkpoint = "checkpoint" in os.path.basename(os.path.normpath(self.model_path))
+
         try:
-            model = TIGERModel.from_pretrained(self.model_path)
+            if is_checkpoint:
+                logger.info(f"检测到检查点目录，使用 __init__ 方法加载: {self.model_path}")
+                # 从主配置重新构建 layer_vocab_sizes
+                rq_config = self.config.h_rqkmeans
+                layer_vocab_sizes = {
+                    'l1': rq_config.need_clusters[0],
+                    'l2': rq_config.need_clusters[1],
+                    'l3': rq_config.need_clusters[2],
+                }
+                # 直接实例化TIGERModel。这将从检查点加载基础T5模型，
+                # 然后重新应用自定义token和嵌入层大小调整。
+                model = TIGERModel(base_model=self.model_path, layer_vocab_sizes=layer_vocab_sizes)
+            else:
+                logger.info(f"正在从 {self.model_path} 加载最终模型 (使用 from_pretrained)...")
+                # 对最终保存的模型使用自定义的 from_pretrained 方法
+                model = TIGERModel.from_pretrained(self.model_path)
+            
             model.model.to(self.device)
             model.model.eval()
             logger.info(f"模型加载成功。词汇表大小: {len(model.tokenizer)}")
             return model
         except Exception as e:
-            logger.error(f"模型加载失败: {e}")
+            logger.error(f"模型加载失败: {e}", exc_info=True)
+            if is_checkpoint:
+                logger.error("加载检查点失败。请确保检查点目录完整，并且Hugging Face模型文件存在。")
+            else:
+                logger.error("加载最终模型失败。请确保模型是使用 TIGERModel.save_pretrained 保存的。")
             sys.exit(1)
 
     def _create_reverse_map(self) -> Dict[Tuple[int, ...], List[str]]:
