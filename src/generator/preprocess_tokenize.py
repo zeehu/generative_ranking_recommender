@@ -1,7 +1,10 @@
 """
-预处理脚本: 极速多进程版本 - 充分利用20核CPU + 50GB内存 
-预计速度: 10,000-15,000 samples/s (10-15倍提升)
-预计时间: 4-7分钟 (vs 原来71分钟)
+预处理脚本: 内存优化版本 - 修复OOM问题
+主要改进:
+1. 减小chunk_size (20000 -> 10000) 降低内存峰值
+2. 流式合并parquet文件，边处理边合并，避免文件堆积
+3. 修复输出长度统计：按语义ID粒度统计
+4. 增强内存清理和垃圾回收
 """
 import os
 import sys
@@ -15,6 +18,7 @@ import pyarrow.parquet as pq
 from typing import List, Tuple
 from multiprocessing import Pool, cpu_count
 import time
+import re
 
 # Add project root to sys.path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
@@ -25,7 +29,7 @@ try:
     from config_optimized import Config
 except ImportError:
     from config import Config
-from src.generator.tiger_model import TIGERModel
+from src.generator.tiger_model import TIGERTokenizer
 from src.common.utils import setup_logging
 
 logger = logging.getLogger(__name__)
@@ -70,9 +74,24 @@ def init_worker(model_name: str, layer_vocab_sizes: dict):
     初始化worker进程的tokenizer（每个进程一个独立的tokenizer）
     """
     global worker_tokenizer
-    from src.generator.tiger_model import TIGERModel
-    model = TIGERModel(base_model=model_name, layer_vocab_sizes=layer_vocab_sizes)
-    worker_tokenizer = model.tokenizer
+    from src.generator.tiger_model_new import TIGERTokenizer
+    worker_tokenizer = TIGERTokenizer(base_model=model_name, layer_vocab_sizes=layer_vocab_sizes)
+
+
+def count_semantic_ids(text: str) -> int:
+    """
+    统计文本中的语义ID数量
+    
+    Args:
+        text: 包含语义ID的文本，如 "<id_l1_3> <id_l2_99> ..."
+    
+    Returns:
+        语义ID的数量
+    """
+    # 匹配 <id_l1_xxx> <id_l2_xxx> <id_l3_xxx> 格式
+    pattern = r'<id_l[123]_\d+>'
+    matches = re.findall(pattern, text)
+    return len(matches)
 
 
 def tokenize_chunk_worker(args: Tuple[List[str], List[str], int, int, int, str]) -> Tuple[str, int]:
@@ -107,6 +126,65 @@ def tokenize_chunk_worker(args: Tuple[List[str], List[str], int, int, int, str])
         return_tensors=None
     )
     
+    # 采样打印：只在第一个chunk（chunk_id=0）打印5条样本
+    if chunk_id == 0:
+        print("\n" + "=" * 100)
+        print(f"📋 采样检查 - Chunk {chunk_id} 的前5条数据")
+        print("=" * 100)
+        
+        num_samples_to_print = min(5, len(input_texts))
+        for i in range(num_samples_to_print):
+            print(f"\n{'─' * 100}")
+            print(f"样本 #{i+1}")
+            print(f"{'─' * 100}")
+            
+            # 原始输入
+            print(f"\n【原始输入】")
+            print(f"  文本: {input_texts[i][:200]}{'...' if len(input_texts[i]) > 200 else ''}")
+            print(f"  长度: {len(input_texts[i])} 字符")
+            
+            # 原始输出 - 修复：按语义ID粒度统计
+            num_semantic_ids = count_semantic_ids(target_texts[i])
+            print(f"\n【原始输出】")
+            print(f"  文本: {target_texts[i][:200]}{'...' if len(target_texts[i]) > 200 else ''}")
+            print(f"  字符长度: {len(target_texts[i])} 字符")
+            print(f"  语义ID数量: {num_semantic_ids} 个")
+            
+            # Tokenize后的输入
+            input_ids = input_encodings['input_ids'][i]
+            attention_mask = input_encodings['attention_mask'][i]
+            print(f"\n【Tokenize后的输入】")
+            print(f"  input_ids: {input_ids[:50]}{'...' if len(input_ids) > 50 else ''}")
+            print(f"  input_ids长度: {len(input_ids)}")
+            print(f"  有效token数: {sum(attention_mask)}")
+            print(f"  padding数: {len(attention_mask) - sum(attention_mask)}")
+            
+            # Tokenize后的输出
+            label_ids = target_encodings['input_ids'][i]
+            label_attention = target_encodings['attention_mask'][i]
+            print(f"\n【Tokenize后的输出】")
+            print(f"  label_ids: {label_ids[:50]}{'...' if len(label_ids) > 50 else ''}")
+            print(f"  label_ids长度: {len(label_ids)}")
+            print(f"  有效token数: {sum(label_attention)}")
+            print(f"  padding数: {len(label_attention) - sum(label_attention)}")
+            
+            # 解码验证（前50个token）
+            decoded_input = worker_tokenizer.base_tokenizer.decode(
+                [tid for tid in input_ids[:50] if tid != worker_tokenizer.base_tokenizer.pad_token_id],
+                skip_special_tokens=False
+            )
+            decoded_target = worker_tokenizer.base_tokenizer.decode(
+                [tid for tid in label_ids[:50] if tid != worker_tokenizer.base_tokenizer.pad_token_id],
+                skip_special_tokens=False
+            )
+            print(f"\n【解码验证（前50个token）】")
+            print(f"  输入解码: {decoded_input}")
+            print(f"  输出解码: {decoded_target}")
+        
+        print(f"\n{'=' * 100}")
+        print(f"✅ 采样检查完成")
+        print(f"{'=' * 100}\n")
+    
     # 构建Arrow Table（零拷贝）
     schema = pa.schema([
         ('input_ids', pa.list_(pa.int64())),
@@ -124,6 +202,10 @@ def tokenize_chunk_worker(args: Tuple[List[str], List[str], int, int, int, str])
     # 写入parquet文件（snappy压缩）
     parquet_file = os.path.join(temp_dir, f"chunk_{chunk_id:06d}.parquet")
     pq.write_table(table, parquet_file, compression='snappy')
+    
+    # 立即释放内存
+    del input_encodings, target_encodings, arrays, table
+    gc.collect()
     
     return parquet_file, len(input_texts)
 
@@ -170,9 +252,72 @@ def read_and_split_data(data_path: str, chunk_size: int) -> List[Tuple[List[str]
     
     logger.info(f"总样本数: {total_lines:,}")
     logger.info(f"分割成 {len(chunks)} 个chunks")
-    logger.info(f"预计每个进程处理 {len(chunks)//cpu_count()} 个chunks")
     
     return chunks
+
+
+def merge_parquet_files_streaming(parquet_files: List[str], output_dir: str, batch_size: int = 30) -> List[str]:
+    """
+    流式合并parquet文件，避免内存堆积
+    
+    Args:
+        parquet_files: parquet文件列表
+        output_dir: 输出目录
+        batch_size: 每批合并的文件数（降低到30以减少内存）
+    
+    Returns:
+        合并后的Arrow文件列表
+    """
+    logger.info(f"\n💾 流式合并parquet文件...")
+    logger.info(f"  总文件数: {len(parquet_files)}")
+    logger.info(f"  批次大小: {batch_size} 文件/批")
+    
+    # 排序文件
+    parquet_files.sort()
+    
+    # 分批合并
+    num_batches = (len(parquet_files) + batch_size - 1) // batch_size
+    logger.info(f"  分 {num_batches} 批合并")
+    
+    arrow_shards = []
+    for i in range(num_batches):
+        start_idx = i * batch_size
+        end_idx = min((i + 1) * batch_size, len(parquet_files))
+        batch_files = parquet_files[start_idx:end_idx]
+        
+        logger.info(f"  合并批次 {i+1}/{num_batches} ({len(batch_files)} 文件)...")
+        
+        # 读取并合并当前批次
+        tables = []
+        for pf in batch_files:
+            tables.append(pq.read_table(pf, memory_map=True))
+        
+        combined_table = pa.concat_tables(tables)
+        del tables
+        gc.collect()
+        
+        # 保存为Arrow shard
+        shard_path = os.path.join(output_dir, f"data-{i:05d}-of-{num_batches:05d}.arrow")
+        with pa.OSFile(shard_path, 'wb') as sink:
+            with pa.ipc.RecordBatchStreamWriter(sink, combined_table.schema) as writer:
+                writer.write_table(combined_table)
+        
+        arrow_shards.append(shard_path)
+        
+        # 立即删除已合并的parquet文件，释放磁盘空间
+        for pf in batch_files:
+            try:
+                os.remove(pf)
+            except:
+                pass
+        
+        del combined_table
+        gc.collect()
+        
+        logger.info(f"  ✅ 批次 {i+1}/{num_batches} 完成")
+    
+    logger.info(f"✅ 流式合并完成，生成 {len(arrow_shards)} 个Arrow文件")
+    return arrow_shards
 
 
 def tokenize_dataset_multiproc(
@@ -182,17 +327,17 @@ def tokenize_dataset_multiproc(
     max_input_len: int,
     max_target_len: int,
     output_path: str,
-    chunk_size: int = 20000,
+    chunk_size: int = 10000,  # 降低到10000以减少内存峰值
     num_proc: int = None
 ):
     """
-    多进程并行tokenize - 充分利用20核CPU + 50GB内存
+    多进程并行tokenize - 内存优化版本
     
     核心优化：
-    1. 多进程并行tokenization（每个进程独立tokenizer）
-    2. 大chunk size（20000样本/chunk，充分利用内存）
-    3. 分批合并parquet（避免OOM）
-    4. Arrow零拷贝 + Snappy压缩
+    1. 减小chunk_size (20000 -> 10000) 降低内存峰值
+    2. 流式合并parquet文件，边处理边合并
+    3. 及时清理临时文件
+    4. 增强垃圾回收
     
     Args:
         data_path: TSV文件路径
@@ -201,20 +346,19 @@ def tokenize_dataset_multiproc(
         max_input_len: 输入最大长度
         max_target_len: 目标最大长度
         output_path: 输出路径
-        chunk_size: 每个chunk的样本数（建议20000-50000）
+        chunk_size: 每个chunk的样本数（降低到10000）
         num_proc: 并行进程数（默认CPU核心数-2）
     """
     if num_proc is None:
         num_proc = max(1, cpu_count() - 2)
     
     logger.info("=" * 80)
-    logger.info("🚀 多进程并行Tokenization（极速版本）")
+    logger.info("🚀 多进程并行Tokenization（内存优化版本）")
     logger.info("=" * 80)
     logger.info(f"文件路径: {data_path}")
-    logger.info(f"Chunk大小: {chunk_size:,} 样本/chunk")
+    logger.info(f"Chunk大小: {chunk_size:,} 样本/chunk (降低以减少内存)")
     logger.info(f"并行进程数: {num_proc} (CPU核心数: {cpu_count()})")
-    logger.info(f"预计速度: 10,000-15,000 samples/s (vs 原来915 samples/s)")
-    logger.info(f"预计提升: 10-15倍")
+    logger.info(f"内存优化: 流式合并 + 及时清理")
     
     start_time = time.time()
     
@@ -269,46 +413,17 @@ def tokenize_dataset_multiproc(
     logger.info(f"   速度: {speed:.0f} samples/s")
     logger.info(f"   生成文件: {len(parquet_files)} 个parquet文件")
     
-    # 步骤3: 分批合并parquet文件（避免OOM）
-    logger.info("\n💾 步骤3: 分批合并parquet文件...")
-    merge_start = time.time()
-    
-    # 创建临时Arrow目录
+    # 步骤3: 流式合并parquet文件
     temp_arrow_dir = output_path + "_temp_arrow"
     safe_remove_dir(temp_arrow_dir)
     os.makedirs(temp_arrow_dir, exist_ok=True)
     
-    # 排序parquet文件
-    parquet_files.sort()
-    
-    # 分批合并：每次50个文件（约100万样本，~2-3GB内存）
-    merge_batch_size = 50
-    num_merge_batches = (len(parquet_files) + merge_batch_size - 1) // merge_batch_size
-    
-    logger.info(f"分 {num_merge_batches} 批合并，每批 {merge_batch_size} 个文件")
-    
-    all_shards = []
-    for i in range(num_merge_batches):
-        start_idx = i * merge_batch_size
-        end_idx = min((i + 1) * merge_batch_size, len(parquet_files))
-        batch_files = parquet_files[start_idx:end_idx]
-        
-        # 读取并合并当前批次
-        tables = [pq.read_table(pf, memory_map=True) for pf in batch_files]
-        combined_table = pa.concat_tables(tables)
-        del tables
-        gc.collect()
-        
-        # 保存为Arrow shard（使用RecordBatchStreamWriter，兼容HFDataset.from_file）
-        shard_path = os.path.join(temp_arrow_dir, f"data-{i:05d}-of-{num_merge_batches:05d}.arrow")
-        with pa.OSFile(shard_path, 'wb') as sink:
-            with pa.ipc.RecordBatchStreamWriter(sink, combined_table.schema) as writer:
-                writer.write_table(combined_table)
-        
-        all_shards.append(shard_path)
-        del combined_table
-        gc.collect()
-    
+    merge_start = time.time()
+    arrow_shards = merge_parquet_files_streaming(
+        parquet_files, 
+        temp_arrow_dir, 
+        batch_size=30  # 降低批次大小以减少内存
+    )
     merge_time = time.time() - merge_start
     logger.info(f"✅ 合并完成，耗时: {merge_time:.1f}秒")
     
@@ -316,8 +431,11 @@ def tokenize_dataset_multiproc(
     logger.info("\n📦 步骤4: 加载为HuggingFace Dataset...")
     load_start = time.time()
     
-    # 使用内存映射加载（不会OOM）
-    datasets_list = [HFDataset.from_file(shard) for shard in all_shards]
+    # 使用内存映射加载
+    datasets_list = []
+    for shard in arrow_shards:
+        datasets_list.append(HFDataset.from_file(shard))
+    
     dataset = concatenate_datasets(datasets_list)
     del datasets_list
     gc.collect()
@@ -343,16 +461,11 @@ def tokenize_dataset_multiproc(
     # 清理所有临时文件
     logger.info("\n🧹 清理临时文件...")
     try:
-        # 删除parquet临时文件
         safe_remove_dir(temp_parquet_dir)
-        
-        # 删除arrow临时文件
         safe_remove_dir(temp_arrow_dir)
-        
         logger.info("✅ 临时文件清理完成")
     except Exception as e:
         logger.warning(f"⚠️ 清理临时文件时出现警告: {e}")
-        logger.warning("临时文件未完全清理，但不影响最终结果")
     
     # 总结
     total_time = time.time() - start_time
@@ -367,10 +480,10 @@ def tokenize_dataset_multiproc(
 
 def preprocess_and_save(config: Config):
     """
-    主函数: 预处理训练集和验证集
+    主函数: 预处理训练集、验证集和测试集
     """
     logger.info("=" * 80)
-    logger.info("🚀 开始预处理tokenization（极速多进程版本）")
+    logger.info("🚀 开始预处理tokenization（内存优化版本）")
     logger.info("=" * 80)
     
     model_config = config.generator_t5
@@ -383,12 +496,21 @@ def preprocess_and_save(config: Config):
         'l3': rq_config.need_clusters[2],
     }
     
+    logger.info(f"\n📊 Tokenizer配置:")
+    logger.info(f"  模型: {model_config.model_name}")
+    logger.info(f"  Layer 1 词表大小: {layer_vocab_sizes['l1']}")
+    logger.info(f"  Layer 2 词表大小: {layer_vocab_sizes['l2']}")
+    logger.info(f"  Layer 3 词表大小: {layer_vocab_sizes['l3']}")
+    logger.info(f"  总语义ID tokens: {sum(layer_vocab_sizes.values())}")
+    
     # 定义输入输出路径
     train_tsv = os.path.join(config.output_dir, "generator", "train.tsv")
     val_tsv = os.path.join(config.output_dir, "generator", "val.tsv")
+    test_tsv = os.path.join(config.output_dir, "generator", "test.tsv")
     
     train_output = os.path.join(config.output_dir, "generator", "train_tokenized")
     val_output = os.path.join(config.output_dir, "generator", "val_tokenized")
+    test_output = os.path.join(config.output_dir, "generator", "test_tokenized")
     
     # 处理训练集
     if os.path.exists(train_tsv):
@@ -413,8 +535,8 @@ def preprocess_and_save(config: Config):
             model_config.max_input_length,
             model_config.max_target_length,
             train_output,
-            chunk_size=20000,  # 20000样本/chunk（平衡内存和速度）
-            num_proc=18  # 20核CPU：使用18个进程（保留2核给系统）
+            chunk_size=10000,  # 降低chunk_size以减少内存
+            num_proc=16  # 降低进程数（从18降到16）以减少内存压力
         )
         
         # 验证数据集
@@ -430,14 +552,6 @@ def preprocess_and_save(config: Config):
         
         del train_dataset
         gc.collect()
-        
-        # 计算磁盘占用
-        import subprocess
-        try:
-            size = subprocess.check_output(['du', '-sh', train_output]).split()[0].decode('utf-8')
-            logger.info(f"💾 磁盘占用: {size}")
-        except:
-            pass
     else:
         logger.warning(f"❌ 训练集文件不存在: {train_tsv}")
     
@@ -464,8 +578,8 @@ def preprocess_and_save(config: Config):
             model_config.max_input_length,
             model_config.max_target_length,
             val_output,
-            chunk_size=20000,
-            num_proc=18
+            chunk_size=10000,
+            num_proc=16
         )
         
         logger.info("\n验证验证集...")
@@ -474,26 +588,58 @@ def preprocess_and_save(config: Config):
         logger.info(f"✅ 数据集特征: {val_dataset.features}")
         del val_dataset
         gc.collect()
-        
-        try:
-            size = subprocess.check_output(['du', '-sh', val_output]).split()[0].decode('utf-8')
-            logger.info(f"💾 磁盘占用: {size}")
-        except:
-            pass
     else:
         logger.warning(f"❌ 验证集文件不存在: {val_tsv}")
+    
+    # 处理测试集
+    if os.path.exists(test_tsv):
+        logger.info("\n" + "=" * 80)
+        logger.info("处理测试集")
+        logger.info("=" * 80)
+        
+        if os.path.exists(test_output):
+            logger.info(f"检测到旧的预处理数据，正在删除: {test_output}")
+            try:
+                safe_remove_dir(test_output)
+            except Exception as e:
+                logger.error(f"❌ 无法删除旧数据: {e}")
+                logger.info("尝试使用新的目录名...")
+                test_output = test_output + f"_new_{int(time.time())}"
+                logger.info(f"新的输出目录: {test_output}")
+        
+        tokenize_dataset_multiproc(
+            test_tsv,
+            model_config.model_name,
+            layer_vocab_sizes,
+            model_config.max_input_length,
+            model_config.max_target_length,
+            test_output,
+            chunk_size=10000,
+            num_proc=16
+        )
+        
+        logger.info("\n验证测试集...")
+        test_dataset = HFDataset.load_from_disk(test_output)
+        logger.info(f"✅ 测试集大小: {len(test_dataset):,} 样本")
+        logger.info(f"✅ 数据集特征: {test_dataset.features}")
+        del test_dataset
+        gc.collect()
+    else:
+        logger.warning(f"❌ 测试集文件不存在: {test_tsv}")
     
     logger.info("\n" + "=" * 80)
     logger.info("🎉 预处理完成！")
     logger.info("=" * 80)
     logger.info(f"✅ 训练集保存位置: {train_output}")
     logger.info(f"✅ 验证集保存位置: {val_output}")
+    if os.path.exists(test_tsv):
+        logger.info(f"✅ 测试集保存位置: {test_output}")
     logger.info("\n现在可以使用优化后的训练脚本进行训练")
 
 
 if __name__ == "__main__":
     config = Config()
-    log_file_path = os.path.join(config.log_dir, "preprocess_tokenize_fast.log")
+    log_file_path = os.path.join(config.log_dir, "preprocess_tokenize_fixed.log")
     setup_logging(log_file=log_file_path)
     logger = logging.getLogger(__name__)
     

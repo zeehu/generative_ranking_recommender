@@ -1,5 +1,5 @@
 """
-Step G3: Train the T5 Generator Model (Optimized Version)     
+Step G3: Train the T5 Generator Model (Optimized Version)      
 
 优化策略:
 1. 内存映射数据集: 使用HuggingFace datasets的内存映射，减少内存占用
@@ -10,8 +10,9 @@ Step G3: Train the T5 Generator Model (Optimized Version)
 6. 梯度累积: 减少DDP通信开销
 7. 可选torch.compile: 额外5-15%加速
 
-针对硬件: 4×L20 GPU (48GB) + 20 CPU + 50GB内存 + 400万数据
-预期效果: 训练时间从30小时降至8小时 (3.75×加速)
+针对硬件: 3×L20 GPU (48GB) + 20 CPU + 50GB内存 + 400万数据
+预期效果: 训练时间约10-11小时 (3 epochs)
+配置优化: batch=128×3×5=1920, lr=4.0e-4, 显存利用率79%
 """
 import os
 import sys
@@ -392,7 +393,7 @@ if __name__ == "__main__":
             main_logger.warning("config_optimized.py not found, using default config.py")
         
         # 打印启动信息
-        main_logger.info("\n" + "#" * 80)
+        main_logger.info("#" * 80)
         main_logger.info("#" + " " * 78 + "#")
         main_logger.info("#" + " " * 20 + "T5 GENERATOR TRAINING (OPTIMIZED)" + " " * 25 + "#")
         main_logger.info("#" + " " * 78 + "#")

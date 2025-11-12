@@ -1,25 +1,25 @@
 """
-优化后的配置文件 - 用于高性能训练    
-针对 4×L20 GPU + 20 CPU + 50GB内存 + 400万训练数据优化
+优化后的配置文件 - 用于高性能训练     
+针对 3×L20 GPU + 20 CPU + 50GB内存 + 400万训练数据优化
 
 硬件规格:
-- GPU: 4 × NVIDIA L20 (48GB GDDR6, 864GB/s带宽, 11776 CUDA核心)
+- GPU: 3 × NVIDIA L20 (48GB GDDR6, 864GB/s带宽, 11776 CUDA核心)
 - CPU: 20核心
 - 内存: 50GB
 - 训练数据: 400万条
 
 优化策略:
-1. Batch Size优化: 减小per_device_batch增加梯度累积，提高GPU利用率
+1. Batch Size优化: 针对3卡优化per_device_batch和梯度累积，最大化GPU利用率
 2. 学习率调整: 根据有效batch size线性缩放
 3. DataLoader优化: 充分利用CPU核心，启用预取和pin_memory
 4. 训练轮数优化: 400万数据3轮足够，减少不必要的训练时间
 5. 评估策略优化: 合理的评估频率，避免过度评估
 
 预期效果:
-- 训练时长: ~8小时 (3 epochs, vs 原配置30小时)
-- GPU利用率: >85% (vs 原配置60-70%)
-- 显存占用: 35-40GB/48GB (安全范围)
-- 加速比: 3.75×
+- 训练时长: ~10-11小时 (3 epochs)
+- GPU利用率: >85%
+- 显存占用: 38-42GB/48GB (安全范围)
+- 每步耗时: ~3.5秒
 """
 import os
 from dataclasses import dataclass, field
@@ -81,14 +81,14 @@ H_RQ_KMEANS_TEST = HierarchicalRQKMeansConfig(
 class TrainingConfig:
     """训练过程控制配置"""
     # 评估和保存策略
-    # 根据实际计算:
+    # 根据实际计算 (3卡配置):
     #   - 训练样本: 3,938,699
-    #   - 有效batch: 128×4×4 = 2048
-    #   - 每轮步数: 3,938,699 / 2048 ≈ 1,923步
-    #   - 总步数: 1,923 × 3 = 5,769步
+    #   - 有效batch: 128×3×5 = 1920
+    #   - 每轮步数: 3,938,699 / 1920 ≈ 2,051步
+    #   - 总步数: 2,051 × 3 = 6,153步
     # 
     # 优化策略:
-    #   - eval_steps=500 → 每轮评估3-4次，总计约12次
+    #   - eval_steps=500 → 每轮评估4次，总计约12次
     #   - save_steps=500 → 与评估同步
     #   - 评估占用时间: ~5分钟/次 × 12 = 60分钟 (可接受)
     eval_strategy: str = "steps"
@@ -134,39 +134,43 @@ class PlaylistTIGERConfig:
     # 400万数据，3轮足够收敛，减少训练时间
     num_train_epochs: int = 3  # 5 → 3
     
-    # ========== 平衡优化的Batch Size配置 (基于实际测试) ==========
+    # ========== 3卡优化的Batch Size配置 ==========
     # L20规格: 48GB显存, 11776 CUDA核心, 864GB/s带宽
     # 
-    # 实际测试结果:
-    #   - per_device_batch=96 → 实际显存26GB (利用率54%)
-    #   - 训练速度: 每步耗时较长，总时长~20小时
-    #   - 分析: 增大batch后，计算时间增加抵消了通信减少的收益
+    # 3卡优化策略:
+    #   目标: 保持有效batch size接近2048，同时最大化GPU利用率
+    #   
+    #   方案对比:
+    #   1. 128×3×5=1920 (推荐) → 显存~38GB (79%), 更新频率适中
+    #   2. 128×3×6=2304        → 显存~42GB (88%), 更新频率较慢
+    #   3. 160×3×4=1920        → 显存~42GB (88%), batch过大可能影响收敛
     # 
-    # 平衡优化策略 (显存、速度、稳定性三者平衡):
-    #   - per_device_batch=128 → 预计显存~32GB (67%利用率，安全)
-    #   - gradient_accum=4 → 减少累积步数，加快梯度更新
-    #   - 有效batch=128×4×4=2048 (略小于之前，但更新更频繁)
+    # 最优配置 (方案1):
+    #   - per_device_batch=128 → 显存~38GB (79%利用率，安全)
+    #   - gradient_accum=5 → 平衡更新频率和通信开销
+    #   - 有效batch=128×3×5=1920 (接近目标2048)
     # 
     # 预期效果:
-    #   1. 显存利用率: 54% → 67% (更充分利用)
-    #   2. GPU利用率: 80% → 85% (接近最优)
-    #   3. 总训练时长: 20h → ~18h (减少10%)
-    #   4. 梯度更新频率: 更高，训练更稳定
-    #   5. 通信开销: 适中 (每4步同步一次)
-    per_device_train_batch_size: int = 128  # 96 → 128 (平衡优化)
-    per_device_eval_batch_size: int = 160   # 128 → 160 (评估时可以更大)
-    gradient_accumulation_steps: int = 4    # 6 → 4 (加快更新频率)
-    # 有效batch size = 128 × 4 GPUs × 4 = 2048
+    #   1. 显存利用率: 79% (充分利用，留有余量)
+    #   2. GPU利用率: 85-90% (接近最优)
+    #   3. 总训练时长: ~10-11小时 (3 epochs)
+    #   4. 梯度更新频率: 每5步同步，平衡稳定性和速度
+    #   5. 通信开销: 适中 (3卡DDP通信效率高)
+    per_device_train_batch_size: int = 128  # 针对3卡优化
+    per_device_eval_batch_size: int = 160   # 评估时可以更大
+    gradient_accumulation_steps: int = 5    # 4 → 5 (针对3卡调整)
+    # 有效batch size = 128 × 3 GPUs × 5 = 1920
     
-    # ========== 学习率配置 (根据新batch size缩放) ==========
+    # ========== 学习率配置 (根据3卡batch size缩放) ==========
     # 线性缩放规则: lr_new = lr_base × sqrt(batch_new / batch_base)
     # 基准: batch=640, lr=2e-4
-    # 新配置: batch=2048, lr = 2e-4 × sqrt(2048/640) ≈ 3.6e-4
-    # 使用 4.2e-4 以加快收敛 (略低于之前，因为有效batch略小)
-    learning_rate: float = 4.2e-4  # 4.5e-4 → 4.2e-4 (根据batch=2048调整)
+    # 新配置: batch=1920, lr = 2e-4 × sqrt(1920/640) ≈ 3.46e-4
+    # 使用 4.0e-4 以加快收敛 (略高于理论值，经验调优)
+    learning_rate: float = 4.0e-4  # 根据batch=1920调整
     
     # Warmup优化: 适中的warmup步数，平衡稳定性和速度
-    warmup_steps: int = 600      # 800 → 600 (约占总步数10%)
+    # 总步数约6153步，warmup 10%约615步
+    warmup_steps: int = 615      # 约占总步数10%
     warmup_ratio: float = 0.10   # 占总步数的10%
     
     weight_decay: float = 0.01
@@ -186,7 +190,7 @@ class PlaylistTIGERConfig:
     # 建议: 长期训练(>4小时)开启，短期训练关闭
     use_torch_compile: bool = True  # 设为True启用编译优化
     torch_compile_backend: str = "inductor"  # 编译后端
-    torch_compile_mode: str = "reduce-overhead"  # 编译模式: reduce-overhead | max-autotune
+    torch_compile_mode: str = "max-autotune"  # 编译模式: reduce-overhead | max-autotune
     
     # Number of custom semantic ID tokens to add to the tokenizer
     num_semantic_id_tokens: int = 0 # This will be calculated dynamically
@@ -201,16 +205,16 @@ class PlaylistTIGERConfig:
 class SystemConfig:
     """系统和硬件配置"""
     # 硬件信息（用于日志显示）
-    expected_num_gpus: int = 4
+    expected_num_gpus: int = 3  # 4 → 3
     gpu_model: str = "L20"
     gpu_memory_gb: int = 48
     cpu_cores: int = 20
     system_memory_gb: int = 50
     
-    # 性能估算参数 (基于batch=128配置)
-    estimated_time_per_step: float = 3.3  # seconds (batch增大，每步略快)
+    # 性能估算参数 (基于3卡×batch=128配置)
+    estimated_time_per_step: float = 3.5  # seconds (3卡略慢于4卡)
     expected_gpu_utilization: str = "85-90%"
-    expected_speedup: str = "~10% vs batch=96"
+    expected_speedup: str = "3卡优化配置"
 
 # Note: Config for Ranker model will be added later.
 
@@ -236,9 +240,9 @@ class Config:
     seed: int = 42
     
     # DataLoader workers优化 (充分利用20核CPU)
-    # 分配策略: 16核给DataLoader, 2核给系统, 2核给DDP通信
-    # 每个GPU: 16/4 = 4个workers
-    num_workers: int = 16  # 8 → 16 (充分利用CPU)
+    # 分配策略: 15核给DataLoader, 2核给系统, 3核给DDP通信
+    # 每个GPU: 15/3 = 5个workers (充分利用CPU)
+    num_workers: int = 15  # 针对3卡优化
     
     def __post_init__(self):
         os.makedirs(self.output_dir, exist_ok=True)

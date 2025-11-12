@@ -15,6 +15,7 @@ venv/
 /outputs/
 /logs/
 /BalanceRqKMeans/
+/GR-movie-recommendation/
 
 # OS-specific
 .DS_Store
