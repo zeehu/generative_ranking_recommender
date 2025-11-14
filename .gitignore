@@ -20,3 +20,6 @@ venv/
 # OS-specific
 .DS_Store
 Thumbs.db
+
+# system prompt
+GEMINI.md

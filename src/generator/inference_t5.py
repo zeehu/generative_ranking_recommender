@@ -47,7 +47,6 @@ class PlaylistGenerator:
         self.model = self._load_model()
         self.semantic_to_song_cluster = self._create_reverse_map()
         self.song_info_map = self._load_song_info()
-        self.interactive_deterministic_mode = True # 交互模式默认为确定性
 
     def _load_model(self) -> TIGERModel:
         """
@@ -120,23 +119,28 @@ class PlaylistGenerator:
             logger.warning(f"歌曲信息文件未找到: {self.config.data.song_info_file}")
         return mapping
 
-    def generate(self, title: str, tags: str = "", max_songs: int = 20, temperature: float = 0.8, deterministic: bool = True, num_beams: int = 5) -> List[Dict]:
+    def generate(self, title: str, tags: str = "", max_songs: int = 20, temperature: float = 0.8) -> List[Dict]:
         """
         根据标题和标签生成歌单，并返回结构化的推荐信息。
+        使用配置文件中的种子进行可复现的采样推理。
         
         Args:
             title: 歌单标题/描述
             tags: 可选标签
             max_songs: 最大生成歌曲数量
             temperature: 采样温度
-            deterministic: 是否确定性推理
-            num_beams: 束搜索大小
             
         Returns:
             一个字典列表，每个字典包含主歌曲、同簇歌曲、语义ID和生成次数等信息。
         """
         prompt = title
         logger.info(f"正在生成歌单，提示: '{prompt}'")
+
+        # --- 使用配置文件中的种子固定随机性以保证可复现性 ---
+        seed = self.config.seed
+        logger.info(f"使用固定随机种子: {seed}")
+        torch.manual_seed(seed)
+        # --- 结束 ---
 
         input_ids = self.model.tokenizer.base_tokenizer(
             prompt, 
@@ -149,18 +153,12 @@ class PlaylistGenerator:
             "max_new_tokens": self.config.generator_t5.max_target_length,
             "pad_token_id": self.model.tokenizer.pad_token_id,
             "num_return_sequences": 1,
+            "do_sample": True,
+            "top_k": 50,
+            "top_p": 0.95,
+            "temperature": temperature
         }
-
-        if deterministic:
-            logger.info(f"使用确定性推理 (Beam Search, num_beams={num_beams})")
-            gen_kwargs['do_sample'] = False
-            gen_kwargs['num_beams'] = num_beams
-        else:
-            logger.info(f"使用采样推理 (Sampling, temperature={temperature})")
-            gen_kwargs['do_sample'] = True
-            gen_kwargs['top_k'] = 50
-            gen_kwargs['top_p'] = 0.95
-            gen_kwargs['temperature'] = temperature
+        logger.info(f"使用采样推理 (Sampling, temperature={temperature})")
 
         with torch.no_grad():
             generated_ids = self.model.model.generate(input_ids, **gen_kwargs)
@@ -255,11 +253,8 @@ class PlaylistGenerator:
         print("\n" + "="*80)
         print("  🎵 T5歌单生成模型 - 交互式演示 🎵")
         print("="*80)
-        print(f"  当前模式: {'确定性' if self.interactive_deterministic_mode else '多样性采样'}")
-        print("  命令:")
-        print("    - 'set mode det': 切换到确定性模式 (可复现)")
-        print("    - 'set mode sample': 切换到多样性采样模式 (随机)")
-        print("    - 'exit' 或 'quit': 退出程序")
+        print("  推理模式: 可复现的采样推理 (使用配置文件中的固定种子)")
+        print("  命令: 'exit' 或 'quit' 退出程序")
         print("-"*80)
 
         while True:
@@ -268,22 +263,12 @@ class PlaylistGenerator:
                 if prompt.lower() in ['exit', 'quit']:
                     print("\n感谢使用，再见！👋")
                     break
-                
-                if prompt.lower() == 'set mode det':
-                    self.interactive_deterministic_mode = True
-                    print(f"✅ 模式已切换为: 确定性")
-                    continue
-                
-                if prompt.lower() == 'set mode sample':
-                    self.interactive_deterministic_mode = False
-                    print(f"✅ 模式已切换为: 多样性采样")
-                    continue
 
                 if not prompt: 
                     continue
 
                 print("\n🎼 生成中，请稍候...")
-                results = self.generate(prompt, deterministic=self.interactive_deterministic_mode)
+                results = self.generate(prompt)
 
                 if not results:
                     print("❌ 模型未能生成有效的歌曲列表，请尝试更换标题或描述。")
@@ -343,7 +328,7 @@ if __name__ == "__main__":
         "-t", "--temperature", 
         type=float, 
         default=0.8,
-        help="采样温度，仅在采样模式下有效 (默认: 0.8)"
+        help="采样温度 (默认: 0.8)"
     )
     parser.add_argument(
         "-l", "--log_level", 
@@ -351,17 +336,6 @@ if __name__ == "__main__":
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="日志级别 (默认: INFO)"
-    )
-    parser.add_argument(
-        "-s", "--sample",
-        action="store_true",
-        help="使用采样推理（随机模式），默认为确定性推理"
-    )
-    parser.add_argument(
-        "-b", "--num_beams",
-        type=int,
-        default=5,
-        help="在确定性推理中使用的束数量 (默认: 5)"
     )
     
     args = parser.parse_args()
@@ -381,14 +355,11 @@ if __name__ == "__main__":
     # 生成或启动交互模式
     if args.prompt:
         # 单次生成模式
-        is_deterministic = not args.sample
         logger.info(f"正在为以下内容生成歌单: '{args.prompt}'")
         results = generator.generate(
             args.prompt, 
             max_songs=args.max_songs,
-            temperature=args.temperature,
-            deterministic=is_deterministic,
-            num_beams=args.num_beams
+            temperature=args.temperature
         )
         
         if results:
@@ -410,3 +381,6 @@ if __name__ == "__main__":
     else:
         # 交互模式
         generator.interactive_demo()
+
+
+    
