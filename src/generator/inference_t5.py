@@ -296,27 +296,24 @@ class PlaylistGenerator:
             logger.warning(f"歌曲信息文件未找到: {self.config.data.song_info_file}")
         return mapping
 
-    def generate(self, title: str, tags: str = "", max_songs: int = 20, temperature: float = 0.8) -> List[Dict]:
+    def generate(self, title: str, tags: str = "", max_songs: int = 20, temperature: float = 0.8, deterministic: bool = False, num_beams: int = 5) -> List[Dict]:
         """
-        根据标题和标签生成歌单
+        根据标题和标签生成歌单，并返回结构化的推荐信息。
         
         Args:
             title: 歌单标题/描述
-            tags: 可选标签（当前未在生成中使用）
+            tags: 可选标签
             max_songs: 最大生成歌曲数量
-            temperature: 采样温度（越高越多样化）
+            temperature: 采样温度
+            deterministic: 是否确定性推理
+            num_beams: 束搜索大小
             
         Returns:
-            歌曲信息字典列表，每个字典包含:
-            - song_id: 歌曲ID
-            - semantic_id: 语义ID元组
-            - cluster_songs: 簇中的所有歌曲ID列表
+            一个字典列表，每个字典包含主歌曲、同簇歌曲、语义ID和生成次数等信息。
         """
-        # 格式化输入提示以匹配训练格式
         prompt = title
         logger.info(f"正在生成歌单，提示: '{prompt}'")
 
-        # 对输入进行分词
         input_ids = self.model.tokenizer.base_tokenizer(
             prompt, 
             return_tensors="pt",
@@ -324,20 +321,26 @@ class PlaylistGenerator:
             truncation=True
         ).input_ids.to(self.device)
 
-        # 生成语义ID
+        gen_kwargs = {
+            "max_new_tokens": self.config.generator_t5.max_target_length,
+            "pad_token_id": self.model.tokenizer.pad_token_id,
+            "num_return_sequences": 1,
+        }
+
+        if deterministic:
+            logger.info(f"使用确定性推理 (Beam Search, num_beams={num_beams})")
+            gen_kwargs['do_sample'] = False
+            gen_kwargs['num_beams'] = num_beams
+        else:
+            logger.info(f"使用采样推理 (Sampling, temperature={temperature})")
+            gen_kwargs['do_sample'] = True
+            gen_kwargs['top_k'] = 50
+            gen_kwargs['top_p'] = 0.95
+            gen_kwargs['temperature'] = temperature
+
         with torch.no_grad():
-            generated_ids = self.model.model.generate(
-                input_ids,
-                max_new_tokens=self.config.generator_t5.max_target_length,
-                do_sample=True,
-                top_k=50,
-                top_p=0.95,
-                temperature=temperature,
-                num_return_sequences=1,
-                pad_token_id=self.model.tokenizer.pad_token_id
-            )
+            generated_ids = self.model.model.generate(input_ids, **gen_kwargs)
         
-        # 解码生成的token
         decoded_tokens = self.model.tokenizer.base_tokenizer.convert_ids_to_tokens(
             generated_ids[0], 
             skip_special_tokens=False
@@ -345,22 +348,13 @@ class PlaylistGenerator:
         
         logger.debug(f"生成的token (前50个): {decoded_tokens[:50]}...")
 
-        # 从层级特定的token中提取语义ID
-        # 格式: <id_l1_X>, <id_l2_Y>, <id_l3_Z>
         semantic_id_tuples = []
         i = 0
         while i < len(decoded_tokens):
             token = decoded_tokens[i]
-            
-            # 检查是否为第1层token
             if token.startswith("<id_l1_"):
-                # 尝试提取完整的3层语义ID
                 if i + 2 < len(decoded_tokens):
-                    l1_token = decoded_tokens[i]
-                    l2_token = decoded_tokens[i + 1]
-                    l3_token = decoded_tokens[i + 2]
-                    
-                    # 验证三个都是语义ID token
+                    l1_token, l2_token, l3_token = decoded_tokens[i], decoded_tokens[i+1], decoded_tokens[i+2]
                     if (l1_token.startswith("<id_l1_") and 
                         l2_token.startswith("<id_l2_") and 
                         l3_token.startswith("<id_l3_")):
@@ -375,64 +369,60 @@ class PlaylistGenerator:
                             pass
             i += 1
         
-        logger.info(f"提取了 {len(semantic_id_tuples)} 个语义ID元组")
-        
-        # 去重同时保持顺序
-        unique_semantic_ids = list(dict.fromkeys(semantic_id_tuples))
-        logger.info(f"唯一语义ID: {len(unique_semantic_ids)}")
-        
-        # DEBUG: 打印全部唯一语义ID及其生成次数
-        if logger.isEnabledFor(logging.DEBUG):
-            from collections import Counter
-            semantic_id_counts = Counter(semantic_id_tuples)
-            
-            logger.debug("\n" + "="*100)
-            logger.debug("全部唯一语义ID序列及其生成次数:")
-            logger.debug("="*100)
-            
-            # 按生成次数从高到低排序
-            sorted_ids = sorted(semantic_id_counts.items(), key=lambda x: x[1], reverse=True)
-            
-            for rank, (sem_id, count) in enumerate(sorted_ids, 1):
-                cluster_size = len(self.semantic_to_song_cluster.get(sem_id, []))
-                status = "✓" if sem_id in self.semantic_to_song_cluster else "✗"
-                logger.debug(
-                    f"{rank:3d}. 语义ID: ({sem_id[0]:3d}, {sem_id[1]:3d}, {sem_id[2]:3d}) | "
-                    f"生成次数: {count:3d} | 簇大小: {cluster_size:3d} | {status}"
-                )
-            
-            logger.debug("="*100)
-            logger.debug(f"统计信息:")
-            logger.debug(f"  - 总生成次数: {len(semantic_id_tuples)}")
-            logger.debug(f"  - 唯一语义ID数: {len(unique_semantic_ids)}")
-            logger.debug(f"  - 有效语义ID数: {sum(1 for sem_id in unique_semantic_ids if sem_id in self.semantic_to_song_cluster)}")
-            logger.debug(f"  - 无效语义ID数: {sum(1 for sem_id in unique_semantic_ids if sem_id not in self.semantic_to_song_cluster)}")
-            logger.debug("="*100 + "\n")
+        logger.info(f"提取了 {len(semantic_id_tuples)} 个语义ID元组 (包含重复)")
 
-        # 对每个唯一的语义ID，从其簇中随机采样一首歌，并保存完整信息
-        reconstructed_songs = []
-        for id_tuple in unique_semantic_ids:
+        # --- 统计、排序语义ID ---
+        id_stats = {}
+        for i, id_tuple in enumerate(semantic_id_tuples):
+            if id_tuple not in id_stats:
+                id_stats[id_tuple] = {"count": 1, "first_index": i}
+            else:
+                id_stats[id_tuple]["count"] += 1
+        
+        sorted_stats = sorted(
+            id_stats.items(), 
+            key=lambda item: (-item[1]['count'], item[1]['first_index'])
+        )
+        
+        logger.debug("--- [DEBUG] 排序后的语义ID生成次数 ---")
+        for id_tuple, stats in sorted_stats:
+            logger.debug(f"ID: {id_tuple}, 生成次数: {stats['count']}, 首次出现位置: {stats['first_index']}")
+        logger.debug("-----------------------------------------")
+        # --- 结束 ---
+
+        # --- 构建结构化的返回结果 ---
+        results = []
+        for id_tuple, stats in sorted_stats:
             if id_tuple in self.semantic_to_song_cluster:
                 song_cluster = self.semantic_to_song_cluster[id_tuple]
-                # 从簇中随机采样一首歌
-                sampled_song = random.choice(song_cluster)
                 
-                # 保存歌曲信息
-                song_info = {
-                    'song_id': sampled_song,
-                    'semantic_id': id_tuple,
-                    'cluster_songs': song_cluster
-                }
-                reconstructed_songs.append(song_info)
-                
-                # 如果达到最大歌曲数则停止
-                if len(reconstructed_songs) >= max_songs:
+                # 确定性地选择主歌曲和其他歌曲
+                sorted_cluster = sorted(song_cluster)
+                primary_song_id = sorted_cluster[0]
+                similar_song_ids = sorted_cluster[1:6] # 最多取5首
+
+                primary_song_info = self.song_info_map.get(primary_song_id, {"name": "未知歌曲", "singer": "未知歌手"})
+                similar_songs_info = [
+                    {"id": song_id, "info": self.song_info_map.get(song_id, {"name": "未知歌曲", "singer": "未知歌手"})}
+                    for song_id in similar_song_ids
+                ]
+
+                results.append({
+                    "primary_song_id": primary_song_id,
+                    "primary_song_info": primary_song_info,
+                    "semantic_id": id_tuple,
+                    "cluster_size": len(song_cluster),
+                    "generation_count": stats['count'],
+                    "similar_songs": similar_songs_info
+                })
+
+                if len(results) >= max_songs:
                     break
             else:
                 logger.debug(f"语义ID {id_tuple} 在簇映射中未找到")
         
-        logger.info(f"生成了 {len(reconstructed_songs)} 首歌曲")
-        return reconstructed_songs
+        logger.info(f"构建了 {len(results)} 条结构化推荐结果")
+        return results
 
     def interactive_demo(self):
         """启动交互式命令行演示"""
@@ -440,8 +430,7 @@ class PlaylistGenerator:
         print("  🎵 T5歌单生成模型 - 交互式演示 🎵")
         print("="*60)
         print("  输入歌单标题或描述，模型会为您生成个性化歌单。")
-        print("  模型会生成语义ID序列，然后从相似歌曲簇中随机采样。")
-        print("  每次生成的歌单可能不同，体现了多样性！")
+        print("  模型会根据生成语义ID的次数进行排序，并展示同簇歌曲。")
         print("  ")
         print("  命令:")
         print("    - 直接输入文本: 生成歌单")
@@ -459,46 +448,27 @@ class PlaylistGenerator:
                     continue
 
                 print("\n🎼 生成中，请稍候...")
-                songs = self.generate(prompt.strip())
+                # 在交互模式下，我们使用多样性采样模式
+                results = self.generate(prompt.strip(), deterministic=False)
 
-                if not songs:
+                if not results:
                     print("❌ 模型未能生成有效的歌曲列表，请尝试更换标题或描述。")
                     continue
                 
-                print(f"\n✨ 为您推荐的歌单 (共{len(songs)}首): ✨")
-                print("="*100)
-                
-                for i, song_data in enumerate(songs, 1):
-                    song_id = song_data['song_id']
-                    sem_id = song_data['semantic_id']
-                    cluster_songs = song_data['cluster_songs']
-                    
-                    info = self.song_info_map.get(song_id, {"name": "未知歌曲", "singer": "未知歌手"})
-                    
-                    # 构建主歌曲信息（紧凑格式）
-                    main_song = f"{i:2d}. {info['name']} - {info['singer']} - {song_id} - {sem_id[0]}, {sem_id[1]}, {sem_id[2]}"
-                    
-                    # 如果簇中有多首歌曲，添加簇信息（最多显示4首其他歌曲）
-                    if len(cluster_songs) > 1:
-                        other_songs = [s for s in cluster_songs if s != song_id]
-                        cluster_info_parts = []
-                        
-                        for other_song_id in other_songs[:4]:
-                            other_info = self.song_info_map.get(other_song_id, {"name": "未知", "singer": "未知"})
-                            # 获取该歌曲的语义ID（应该和主歌曲相同）
-                            cluster_info_parts.append(f"{other_info['name']} - {other_info['singer']} - {other_song_id}")
-                        
-                        if cluster_info_parts:
-                            cluster_str = "; ".join(cluster_info_parts)
-                            if len(other_songs) > 4:
-                                cluster_str += f"; ... 还有{len(other_songs)-4}首"
-                            print(f"{main_song} ({cluster_str})")
-                        else:
-                            print(main_song)
-                    else:
-                        print(main_song)
-                
-                print("="*100)
+                print(f"\n✨ 为您推荐的歌单 (共{len(results)}首): ✨")
+                print("-"*60)
+                for i, item in enumerate(results, 1):
+                    info = item['primary_song_info']
+                    print(f"  {i:2d}. {info['name']} - {info['singer']}")
+                    print(f"      (来自含{item['cluster_size']}首歌的簇, 模型生成 {item['generation_count']} 次)")
+
+                    if item['similar_songs']:
+                        print(f"      └── 相似歌曲:")
+                        for sim_item in item['similar_songs']:
+                            sim_info = sim_item['info']
+                            print(f"          - {sim_info['name']} - {sim_info['singer']}")
+
+                print("-"*60)
 
             except KeyboardInterrupt:
                 print("\n\n感谢使用，再见！👋")
@@ -549,6 +519,17 @@ if __name__ == "__main__":
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="日志级别 (默认: INFO)"
     )
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="使用确定性推理（Beam Search），而不是采样"
+    )
+    parser.add_argument(
+        "--num_beams",
+        type=int,
+        default=5,
+        help="在确定性推理中使用的束数量 (默认: 5)"
+    )
     
     args = parser.parse_args()
     
@@ -568,47 +549,29 @@ if __name__ == "__main__":
     if args.prompt:
         # 单次生成模式
         logger.info(f"正在为以下内容生成歌单: '{args.prompt}'")
-        songs = generator.generate(
+        results = generator.generate(
             args.prompt, 
             max_songs=args.max_songs,
-            temperature=args.temperature
+            temperature=args.temperature,
+            deterministic=args.deterministic,
+            num_beams=args.num_beams
         )
         
-        if songs:
-            print(f"\n生成的歌单 (共{len(songs)}首):")
-            print("="*100)
-            
-            for i, song_data in enumerate(songs, 1):
-                song_id = song_data['song_id']
-                sem_id = song_data['semantic_id']
-                cluster_songs = song_data['cluster_songs']
-                
-                info = generator.song_info_map.get(song_id, {"name": "未知歌曲", "singer": "未知歌手"})
-                
-                # 构建主歌曲信息（紧凑格式）
-                main_song = f"{i:2d}. {info['name']} - {info['singer']} - {song_id} - {sem_id[0]}, {sem_id[1]}, {sem_id[2]}"
-                
-                # 如果簇中有多首歌曲，添加簇信息（最多显示4首其他歌曲）
-                if len(cluster_songs) > 1:
-                    other_songs = [s for s in cluster_songs if s != song_id]
-                    cluster_info_parts = []
-                    
-                    for other_song_id in other_songs[:4]:
-                        other_info = generator.song_info_map.get(other_song_id, {"name": "未知", "singer": "未知"})
-                        # 获取该歌曲的语义ID（应该和主歌曲相同）
-                        cluster_info_parts.append(f"{other_info['name']} - {other_info['singer']} - {other_song_id}")
-                    
-                    if cluster_info_parts:
-                        cluster_str = "; ".join(cluster_info_parts)
-                        if len(other_songs) > 4:
-                            cluster_str += f"; ... 还有{len(other_songs)-4}首"
-                        print(f"{main_song} ({cluster_str})")
-                    else:
-                        print(main_song)
-                else:
-                    print(main_song)
-            
-            print("="*100)
+        if results:
+            print(f"\n生成的歌单 (共{len(results)}首):")
+            print("="*60)
+            for i, item in enumerate(results, 1):
+                info = item['primary_song_info']
+                print(f"{i:2d}. {info['name']} - {info['singer']}")
+                print(f"   (来自含{item['cluster_size']}首歌的簇, 模型生成 {item['generation_count']} 次)")
+
+                if item['similar_songs']:
+                    print(f"   └── 相似歌曲:")
+                    for sim_item in item['similar_songs']:
+                        sim_info = sim_item['info']
+                        print(f"       - {sim_info['name']} - {sim_info['singer']}")
+                print("-" * 20) # Add a small separator for clarity
+            print("="*60)
         else:
             print("未能生成有效的歌单，请尝试其他提示文本。")
     else:
