@@ -1,5 +1,5 @@
 """
-T5歌单生成模型推理脚本    
+T5歌单生成模型推理脚本       
 用于加载训练好的T5模型并根据输入文本生成歌曲推荐
 
 支持两种模型加载方式:
@@ -380,6 +380,34 @@ class PlaylistGenerator:
         # 去重同时保持顺序
         unique_semantic_ids = list(dict.fromkeys(semantic_id_tuples))
         logger.info(f"唯一语义ID: {len(unique_semantic_ids)}")
+        
+        # DEBUG: 打印全部唯一语义ID及其生成次数
+        if logger.isEnabledFor(logging.DEBUG):
+            from collections import Counter
+            semantic_id_counts = Counter(semantic_id_tuples)
+            
+            logger.debug("\n" + "="*100)
+            logger.debug("全部唯一语义ID序列及其生成次数:")
+            logger.debug("="*100)
+            
+            # 按生成次数从高到低排序
+            sorted_ids = sorted(semantic_id_counts.items(), key=lambda x: x[1], reverse=True)
+            
+            for rank, (sem_id, count) in enumerate(sorted_ids, 1):
+                cluster_size = len(self.semantic_to_song_cluster.get(sem_id, []))
+                status = "✓" if sem_id in self.semantic_to_song_cluster else "✗"
+                logger.debug(
+                    f"{rank:3d}. 语义ID: ({sem_id[0]:3d}, {sem_id[1]:3d}, {sem_id[2]:3d}) | "
+                    f"生成次数: {count:3d} | 簇大小: {cluster_size:3d} | {status}"
+                )
+            
+            logger.debug("="*100)
+            logger.debug(f"统计信息:")
+            logger.debug(f"  - 总生成次数: {len(semantic_id_tuples)}")
+            logger.debug(f"  - 唯一语义ID数: {len(unique_semantic_ids)}")
+            logger.debug(f"  - 有效语义ID数: {sum(1 for sem_id in unique_semantic_ids if sem_id in self.semantic_to_song_cluster)}")
+            logger.debug(f"  - 无效语义ID数: {sum(1 for sem_id in unique_semantic_ids if sem_id not in self.semantic_to_song_cluster)}")
+            logger.debug("="*100 + "\n")
 
         # 对每个唯一的语义ID，从其簇中随机采样一首歌，并保存完整信息
         reconstructed_songs = []
