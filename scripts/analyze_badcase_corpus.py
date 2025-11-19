@@ -1,0 +1,401 @@
+"""
+BadCase分析工具 - 用于分析T5模型生成效果不符合预期的原因 
+
+功能：
+1. 加载歌单信息、歌单-歌曲数据、歌曲信息
+2. 根据歌单标题关键词搜索相关歌单
+3. 统计这些歌单包含的歌曲及其出现频次
+4. 按频次从高到低展示歌曲和歌单信息
+
+使用场景：
+- 分析模型生成的badcase是否与训练语料有关
+- 检查特定关键词的歌单数据分布
+- 理解歌单-歌曲的关联关系
+"""
+
+import os
+import sys
+import csv
+import json
+import logging
+from collections import defaultdict, Counter
+from typing import Dict, List, Tuple, Set
+from tqdm import tqdm
+from tabulate import tabulate
+
+# Add project root to sys.path
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+from config_optimized import Config
+from src.common.utils import setup_logging
+
+logger = logging.getLogger(__name__)
+
+
+class BadCaseAnalyzer:
+    """BadCase分析工具类"""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.data_config = config.data
+        
+        # 数据容器
+        self.playlist_info: Dict = {}
+        self.playlist_songs: Dict[str, List[str]] = {}
+        self.song_info: Dict = {}
+        
+        logger.info("初始化BadCase分析工具...")
+        self._load_all_data()
+    
+    def _load_all_data(self):
+        """加载所有必要的数据文件"""
+        logger.info("=" * 80)
+        logger.info("开始加载数据文件...")
+        logger.info("=" * 80)
+        
+        self._load_playlist_info()
+        self._load_playlist_songs()
+        self._load_song_info()
+        
+        logger.info("=" * 80)
+        logger.info("数据加载完成！")
+        logger.info(f"  - 歌单数量: {len(self.playlist_info):,}")
+        logger.info(f"  - 歌单-歌曲关系数: {sum(len(songs) for songs in self.playlist_songs.values()):,}")
+        logger.info(f"  - 歌曲数量: {len(self.song_info):,}")
+        logger.info("=" * 80)
+    
+    def _load_playlist_info(self):
+        """加载歌单信息"""
+        logger.info(f"加载歌单信息: {self.data_config.playlist_info_file}")
+        try:
+            with open(self.data_config.playlist_info_file, 'r', encoding='utf-8') as f:
+                reader = csv.DictReader(f, delimiter='\t')
+                
+                for row in tqdm(reader, desc="加载歌单信息", unit="条"):
+                    glid = str(row.get('glid', ''))
+                    if glid:
+                        self.playlist_info[glid] = {
+                            'glid': glid,
+                            'listname': str(row.get('listname', '')),
+                            'description': str(row.get('description', '')),
+                            'creator': str(row.get('creator', '')),
+                            'tags': str(row.get('tags', '')),
+                        }
+            
+            logger.info(f"✓ 成功加载 {len(self.playlist_info):,} 个歌单信息")
+        except FileNotFoundError:
+            logger.error(f"✗ 歌单信息文件不存在: {self.data_config.playlist_info_file}")
+            sys.exit(1)
+        except Exception as e:
+            logger.error(f"✗ 加载歌单信息失败: {e}")
+            sys.exit(1)
+    
+    def _load_playlist_songs(self):
+        """加载歌单-歌曲关系数据"""
+        logger.info(f"加载歌单-歌曲数据: {self.data_config.playlist_songs_file}")
+        try:
+            with open(self.data_config.playlist_songs_file, 'r', encoding='utf-8') as f:
+                reader = csv.reader(f, delimiter='\t')
+                
+                for row in tqdm(reader, desc="加载歌单-歌曲关系", unit="条"):
+                    if len(row) < 2:
+                        continue
+                    
+                    playlist_id = str(row[0])
+                    song_id = str(row[1])
+                    
+                    if playlist_id not in self.playlist_songs:
+                        self.playlist_songs[playlist_id] = []
+                    self.playlist_songs[playlist_id].append(song_id)
+            
+            logger.info(f"✓ 成功加载 {len(self.playlist_songs):,} 个歌单的歌曲关系")
+        except FileNotFoundError:
+            logger.error(f"✗ 歌单-歌曲文件不存在: {self.data_config.playlist_songs_file}")
+            sys.exit(1)
+        except Exception as e:
+            logger.error(f"✗ 加载歌单-歌曲数据失败: {e}")
+            sys.exit(1)
+    
+    def _load_song_info(self):
+        """加载歌曲信息"""
+        logger.info(f"加载歌曲信息: {self.data_config.song_info_file}")
+        try:
+            with open(self.data_config.song_info_file, 'r', encoding='utf-8') as f:
+                reader = csv.reader(f, delimiter='\t')
+                
+                for row in tqdm(reader, desc="加载歌曲信息", unit="条"):
+                    if len(row) < 3:
+                        continue
+                    
+                    song_id = str(row[0]).strip()
+                    song_name = str(row[1]).strip()
+                    artist = str(row[2]).strip()
+                    
+                    if song_id:
+                        self.song_info[song_id] = {
+                            'song_id': song_id,
+                            'song_name': song_name,
+                            'artist': artist,
+                        }
+            
+            logger.info(f"✓ 成功加载 {len(self.song_info):,} 个歌曲信息")
+        except FileNotFoundError:
+            logger.error(f"✗ 歌曲信息文件不存在: {self.data_config.song_info_file}")
+            sys.exit(1)
+        except Exception as e:
+            logger.error(f"✗ 加载歌曲信息失败: {e}")
+            sys.exit(1)
+    
+    def search_playlists_by_keyword(self, keyword: str) -> List[str]:
+        """
+        根据关键词搜索歌单
+        
+        Args:
+            keyword: 搜索关键词
+            
+        Returns:
+            匹配的歌单ID列表
+        """
+        keyword_lower = keyword.lower()
+        matched_playlists = []
+        
+        for glid, info in self.playlist_info.items():
+            listname = info.get('listname', '').lower()
+            description = info.get('description', '').lower()
+            tags = info.get('tags', '').lower()
+            
+            # 在标题、描述、标签中搜索关键词
+            if (keyword_lower in listname or 
+                keyword_lower in description or 
+                keyword_lower in tags):
+                matched_playlists.append(glid)
+        
+        return matched_playlists
+    
+    def analyze_badcase(self, keyword: str, top_n: int = 20):
+        """
+        分析特定关键词的badcase
+        
+        Args:
+            keyword: 搜索关键词
+            top_n: 显示前N个高频歌曲
+        """
+        logger.info("=" * 80)
+        logger.info(f"开始分析关键词: '{keyword}'")
+        logger.info("=" * 80)
+        
+        # 1. 搜索匹配的歌单
+        matched_playlists = self.search_playlists_by_keyword(keyword)
+        
+        if not matched_playlists:
+            logger.warning(f"未找到包含关键词 '{keyword}' 的歌单")
+            return
+        
+        logger.info(f"\n✓ 找到 {len(matched_playlists):,} 个包含关键词的歌单")
+        
+        # 2. 统计歌曲出现频次
+        song_frequency = Counter()
+        playlist_song_map = defaultdict(set)  # 记录每首歌在哪些歌单中出现
+        
+        for glid in tqdm(matched_playlists, desc="统计歌曲频次", unit="个歌单"):
+            if glid in self.playlist_songs:
+                songs = self.playlist_songs[glid]
+                for song_id in songs:
+                    song_frequency[song_id] += 1
+                    playlist_song_map[song_id].add(glid)
+        
+        logger.info(f"✓ 统计到 {len(song_frequency):,} 首不同的歌曲")
+        
+        # 3. 按频次排序
+        top_songs = song_frequency.most_common(top_n)
+        
+        # 4. 构建输出表格
+        logger.info("\n" + "=" * 80)
+        logger.info(f"高频歌曲排行 (Top {top_n})")
+        logger.info("=" * 80)
+        
+        table_data = []
+        for rank, (song_id, freq) in enumerate(top_songs, 1):
+            song_info = self.song_info.get(song_id, {})
+            song_name = song_info.get('song_name', 'N/A')
+            artist = song_info.get('artist', 'N/A')
+            
+            # 获取包含该歌曲的歌单数
+            playlist_count = len(playlist_song_map[song_id])
+            
+            table_data.append([
+                rank,
+                song_id,
+                song_name,
+                artist,
+                freq,
+                playlist_count
+            ])
+        
+        headers = ['排名', '歌曲ID', '歌曲名称', '歌手', '出现次数', '所在歌单数']
+        print("\n" + tabulate(table_data, headers=headers, tablefmt='grid'))
+        
+        # 5. 显示歌单信息统计
+        logger.info("\n" + "=" * 80)
+        logger.info(f"歌单信息统计 (共 {len(matched_playlists):,} 个歌单)")
+        logger.info("=" * 80)
+        
+        playlist_table_data = []
+        for idx, glid in enumerate(matched_playlists[:20], 1):  # 显示前20个歌单
+            info = self.playlist_info.get(glid, {})
+            listname = info.get('listname', 'N/A')
+            song_count = len(self.playlist_songs.get(glid, []))
+            creator = info.get('creator', 'N/A')
+            
+            playlist_table_data.append([
+                idx,
+                glid,
+                listname,
+                song_count,
+                creator
+            ])
+        
+        playlist_headers = ['序号', '歌单ID', '歌单标题', '歌曲数', '创建者']
+        print("\n" + tabulate(playlist_table_data, headers=playlist_headers, tablefmt='grid'))
+        
+        if len(matched_playlists) > 20:
+            logger.info(f"\n... 还有 {len(matched_playlists) - 20:,} 个歌单未显示")
+        
+        # 6. 统计信息
+        logger.info("\n" + "=" * 80)
+        logger.info("统计摘要")
+        logger.info("=" * 80)
+        
+        total_songs_in_playlists = sum(len(self.playlist_songs.get(glid, [])) for glid in matched_playlists)
+        avg_songs_per_playlist = total_songs_in_playlists / len(matched_playlists) if matched_playlists else 0
+        
+        logger.info(f"关键词: '{keyword}'")
+        logger.info(f"匹配歌单数: {len(matched_playlists):,}")
+        logger.info(f"不同歌曲数: {len(song_frequency):,}")
+        logger.info(f"歌单中歌曲总数: {total_songs_in_playlists:,}")
+        logger.info(f"平均每个歌单的歌曲数: {avg_songs_per_playlist:.2f}")
+        logger.info(f"最高频歌曲: {top_songs[0][0]} (出现 {top_songs[0][1]:,} 次)")
+        logger.info(f"最低频歌曲: {top_songs[-1][0]} (出现 {top_songs[-1][1]:,} 次)")
+        
+        # 7. 保存详细结果到文件
+        self._save_analysis_results(keyword, matched_playlists, song_frequency, playlist_song_map)
+    
+    def _save_analysis_results(self, keyword: str, matched_playlists: List[str], 
+                               song_frequency: Counter, playlist_song_map: Dict):
+        """保存分析结果到文件"""
+        output_dir = os.path.join(self.config.output_dir, "badcase_analysis")
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # 清理关键词以用作文件名
+        safe_keyword = "".join(c if c.isalnum() else "_" for c in keyword)
+        
+        # 1. 保存歌曲频次统计
+        songs_output_file = os.path.join(output_dir, f"{safe_keyword}_songs_frequency.csv")
+        logger.info(f"\n保存歌曲频次统计...")
+        with open(songs_output_file, 'w', newline='', encoding='utf-8-sig') as f:
+            writer = csv.DictWriter(f, fieldnames=['song_id', 'song_name', 'artist', 'frequency', 'playlist_count'])
+            writer.writeheader()
+            
+            for song_id, freq in tqdm(song_frequency.most_common(), desc="保存歌曲数据", unit="首"):
+                song_info = self.song_info.get(song_id, {})
+                writer.writerow({
+                    'song_id': song_id,
+                    'song_name': song_info.get('song_name', ''),
+                    'artist': song_info.get('artist', ''),
+                    'frequency': freq,
+                    'playlist_count': len(playlist_song_map[song_id])
+                })
+        
+        logger.info(f"✓ 歌曲频次统计已保存: {songs_output_file}")
+        
+        # 2. 保存歌单信息
+        playlists_output_file = os.path.join(output_dir, f"{safe_keyword}_playlists_info.csv")
+        logger.info(f"保存歌单信息...")
+        with open(playlists_output_file, 'w', newline='', encoding='utf-8-sig') as f:
+            writer = csv.DictWriter(f, fieldnames=['glid', 'listname', 'description', 'creator', 'tags', 'song_count'])
+            writer.writeheader()
+            
+            for glid in tqdm(matched_playlists, desc="保存歌单数据", unit="个"):
+                info = self.playlist_info.get(glid, {})
+                writer.writerow({
+                    'glid': glid,
+                    'listname': info.get('listname', ''),
+                    'description': info.get('description', ''),
+                    'creator': info.get('creator', ''),
+                    'tags': info.get('tags', ''),
+                    'song_count': len(self.playlist_songs.get(glid, []))
+                })
+        
+        logger.info(f"✓ 歌单信息已保存: {playlists_output_file}")
+        
+        # 3. 保存详细的歌单-歌曲映射
+        mapping_output_file = os.path.join(output_dir, f"{safe_keyword}_playlist_song_mapping.json")
+        logger.info(f"保存歌单-歌曲映射...")
+        mapping_data = {}
+        for glid in tqdm(matched_playlists, desc="保存映射数据", unit="个"):
+            info = self.playlist_info.get(glid, {})
+            songs = self.playlist_songs.get(glid, [])
+            mapping_data[glid] = {
+                'listname': info.get('listname', ''),
+                'songs': songs,
+                'song_count': len(songs)
+            }
+        
+        with open(mapping_output_file, 'w', encoding='utf-8') as f:
+            json.dump(mapping_data, f, ensure_ascii=False, indent=2)
+        logger.info(f"✓ 歌单-歌曲映射已保存: {mapping_output_file}")
+    
+    def interactive_mode(self):
+        """交互式模式"""
+        logger.info("\n" + "=" * 80)
+        logger.info("进入交互式分析模式")
+        logger.info("输入 'exit' 或 'quit' 退出")
+        logger.info("=" * 80 + "\n")
+        
+        while True:
+            try:
+                keyword = input("请输入歌单标题关键词: ").strip()
+                
+                if keyword.lower() in ['exit', 'quit']:
+                    logger.info("退出分析工具")
+                    break
+                
+                if not keyword:
+                    logger.warning("关键词不能为空，请重新输入")
+                    continue
+                
+                top_n = input("显示前N个高频歌曲 (默认20): ").strip()
+                try:
+                    top_n = int(top_n) if top_n else 20
+                except ValueError:
+                    logger.warning("输入的数字无效，使用默认值20")
+                    top_n = 20
+                
+                self.analyze_badcase(keyword, top_n)
+                
+            except KeyboardInterrupt:
+                logger.info("\n用户中断，退出分析工具")
+                break
+            except Exception as e:
+                logger.error(f"发生错误: {e}")
+                continue
+
+
+def main():
+    """主函数"""
+    config = Config()
+    log_file_path = os.path.join(config.log_dir, "badcase_analysis.log")
+    setup_logging(log_file=log_file_path)
+    logger = logging.getLogger(__name__)
+    
+    # 创建分析工具
+    analyzer = BadCaseAnalyzer(config)
+    
+    # 进入交互式模式
+    analyzer.interactive_mode()
+
+
+if __name__ == "__main__":
+    main()

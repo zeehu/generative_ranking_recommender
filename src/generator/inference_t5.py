@@ -1,5 +1,4 @@
-"""
-"""
+""" 
 T5歌单生成模型推理脚本
 用于加载训练好的T5模型并根据输入文本生成歌曲推荐
 """
@@ -20,6 +19,7 @@ if project_root not in sys.path:
 
 from config import Config
 from src.generator.tiger_model import TIGERModel
+from src.generator.semantic_id_trie import SemanticIDTrie, ConstrainedLogitsProcessor
 from src.common.utils import setup_logging
 
 logger = logging.getLogger(__name__)
@@ -28,13 +28,14 @@ logger = logging.getLogger(__name__)
 class PlaylistGenerator:
     """处理模型加载和根据文本提示生成歌单"""
 
-    def __init__(self, config: Config, model_path: str = None):
+    def __init__(self, config: Config, model_path: str = None, use_trie_constraint: bool = True):
         """
         初始化歌单生成器
         
         Args:
             config: 配置对象
             model_path: 模型路径，如果为None则使用默认路径
+            use_trie_constraint: 是否使用Trie树约束生成（默认True）
         """
         self.config = config
         self.device = torch.device(config.device if torch.cuda.is_available() else 'cpu')
@@ -47,6 +48,14 @@ class PlaylistGenerator:
         self.model = self._load_model()
         self.semantic_to_song_cluster = self._create_reverse_map()
         self.song_info_map = self._load_song_info()
+        
+        # 初始化Trie树约束（如果启用）
+        self.use_trie_constraint = use_trie_constraint
+        self.trie = None
+        self.constrained_processor = None
+        
+        if self.use_trie_constraint:
+            self._init_trie_constraint()
 
     def _load_model(self) -> TIGERModel:
         """
@@ -118,6 +127,38 @@ class PlaylistGenerator:
         except FileNotFoundError: 
             logger.warning(f"歌曲信息文件未找到: {self.config.data.song_info_file}")
         return mapping
+    
+    def _init_trie_constraint(self):
+        """初始化Trie树约束"""
+        try:
+            semantic_ids_file = os.path.join(self.config.output_dir, "semantic_id", "song_semantic_ids.jsonl")
+            logger.info("正在初始化Trie树约束...")
+            
+            # 构建Trie树
+            self.trie = SemanticIDTrie(self.model.tokenizer, semantic_ids_file)
+            
+            # 创建约束处理器
+            self.constrained_processor = ConstrainedLogitsProcessor(
+                self.trie, 
+                self.model.tokenizer, 
+                self.model.tokenizer.eos_token_id
+            )
+            
+            # 打印统计信息
+            stats = self.trie.get_statistics()
+            logger.info(f"Trie树统计信息:")
+            logger.info(f"  - 有效语义ID序列总数: {stats['total_valid_sequences']}")
+            logger.info(f"  - 唯一L1 token数量: {stats['unique_l1_tokens']}")
+            logger.info(f"  - L2分布: {dict(stats['l2_distribution'])}")
+            logger.info(f"  - L3分布: {dict(stats['l3_distribution'])}")
+            logger.info("Trie树约束初始化成功！")
+            
+        except Exception as e:
+            logger.warning(f"初始化Trie树约束失败: {e}")
+            logger.warning("将使用无约束生成模式")
+            self.use_trie_constraint = False
+            self.trie = None
+            self.constrained_processor = None
 
     def generate(self, title: str, tags: str = "", max_songs: int = 20, temperature: float = 0.8) -> List[Dict]:
         """
@@ -158,7 +199,13 @@ class PlaylistGenerator:
             "top_p": 0.95,
             "temperature": temperature
         }
-        logger.info(f"使用采样推理 (Sampling, temperature={temperature})")
+        
+        # 添加Trie树约束（如果启用）
+        if self.use_trie_constraint and self.constrained_processor is not None:
+            gen_kwargs["logits_processor"] = [self.constrained_processor]
+            logger.info(f"使用Trie树约束采样推理 (Constrained Sampling, temperature={temperature})")
+        else:
+            logger.info(f"使用无约束采样推理 (Sampling, temperature={temperature})")
 
         with torch.no_grad():
             generated_ids = self.model.model.generate(input_ids, **gen_kwargs)
@@ -192,6 +239,19 @@ class PlaylistGenerator:
             i += 1
         
         logger.info(f"提取了 {len(semantic_id_tuples)} 个语义ID元组 (包含重复)")
+        
+        # 如果使用了Trie树约束，验证生成的语义ID是否都有效
+        if self.use_trie_constraint and self.trie is not None:
+            invalid_count = 0
+            for id_tuple in semantic_id_tuples:
+                if id_tuple not in self.trie.valid_semantic_ids:
+                    invalid_count += 1
+                    logger.debug(f"检测到无效的语义ID: {id_tuple}")
+            
+            if invalid_count > 0:
+                logger.warning(f"生成了 {invalid_count} 个无效的语义ID（共{len(semantic_id_tuples)}个）")
+            else:
+                logger.info(f"所有生成的语义ID都是有效的！")
 
         id_stats = {}
         for i, id_tuple in enumerate(semantic_id_tuples):
@@ -253,7 +313,8 @@ class PlaylistGenerator:
         print("\n" + "="*80)
         print("  🎵 T5歌单生成模型 - 交互式演示 🎵")
         print("="*80)
-        print("  推理模式: 可复现的采样推理 (使用配置文件中的固定种子)")
+        constraint_mode = "Trie树约束" if self.use_trie_constraint else "无约束"
+        print(f"  推理模式: {constraint_mode}采样推理 (使用配置文件中的固定种子)")
         print("  命令: 'exit' 或 'quit' 退出程序")
         print("-"*80)
 
@@ -337,6 +398,11 @@ if __name__ == "__main__":
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="日志级别 (默认: INFO)"
     )
+    parser.add_argument(
+        "--no_trie_constraint",
+        action="store_true",
+        help="禁用Trie树约束生成（默认启用）"
+    )
     
     args = parser.parse_args()
     
@@ -350,7 +416,8 @@ if __name__ == "__main__":
     
     # 创建生成器
     logger.info("正在初始化歌单生成器...")
-    generator = PlaylistGenerator(config, model_path=args.model_path)
+    use_trie = not args.no_trie_constraint
+    generator = PlaylistGenerator(config, model_path=args.model_path, use_trie_constraint=use_trie)
     
     # 生成或启动交互模式
     if args.prompt:
