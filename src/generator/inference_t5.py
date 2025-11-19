@@ -160,16 +160,21 @@ class PlaylistGenerator:
             self.trie = None
             self.constrained_processor = None
 
-    def generate(self, title: str, tags: str = "", max_songs: int = 20, temperature: float = 0.8) -> List[Dict]:
+    def generate(self, title: str, tags: str = "", max_songs: int = 20, 
+                 do_sample: bool = False, num_beams: int = 1, temperature: float = 1.0, 
+                 top_k: int = 50, top_p: float = 1.0) -> List[Dict]:
         """
         根据标题和标签生成歌单，并返回结构化的推荐信息。
-        使用配置文件中的种子进行可复现的采样推理。
         
         Args:
             title: 歌单标题/描述
             tags: 可选标签
             max_songs: 最大生成歌曲数量
+            do_sample: 是否使用采样
+            num_beams: Beam search数量
             temperature: 采样温度
+            top_k: Top-k采样
+            top_p: Top-p采样
             
         Returns:
             一个字典列表，每个字典包含主歌曲、同簇歌曲、语义ID和生成次数等信息。
@@ -194,18 +199,29 @@ class PlaylistGenerator:
             "max_new_tokens": self.config.generator_t5.max_target_length,
             "pad_token_id": self.model.tokenizer.pad_token_id,
             "num_return_sequences": 1,
-            "do_sample": True,
-            "top_k": 50,
-            "top_p": 0.95,
-            "temperature": temperature
         }
+
+        # --- Dynamically build generation arguments ---
+        if do_sample:
+            gen_kwargs["do_sample"] = True
+            gen_kwargs["top_k"] = top_k
+            gen_kwargs["top_p"] = top_p
+            gen_kwargs["temperature"] = temperature
+            logger.info(f"使用采样解码策略 (Top-K: {top_k}, Top-P: {top_p}, Temp: {temperature})")
+        else:
+            gen_kwargs["do_sample"] = False
+            gen_kwargs["num_beams"] = num_beams
+            if num_beams > 1:
+                logger.info(f"使用Beam Search解码策略 (Beams: {num_beams})")
+            else:
+                logger.info("使用Greedy Search解码策略")
         
         # 添加Trie树约束（如果启用）
         if self.use_trie_constraint and self.constrained_processor is not None:
             gen_kwargs["logits_processor"] = [self.constrained_processor]
-            logger.info(f"使用Trie树约束采样推理 (Constrained Sampling, temperature={temperature})")
+            logger.info(f"使用Trie树约束")
         else:
-            logger.info(f"使用无约束采样推理 (Sampling, temperature={temperature})")
+            logger.info(f"使用无约束生成")
 
         with torch.no_grad():
             generated_ids = self.model.model.generate(input_ids, **gen_kwargs)
@@ -308,13 +324,25 @@ class PlaylistGenerator:
         singer = song_info.get("singer", "未知歌手")
         return f"{song_id}-{name}-{singer}"
 
-    def interactive_demo(self):
-        """启动交互式命令行演示"""
+    def interactive_demo(self, **kwargs):
+        """
+        启动交互式命令行演示。
+        会使用命令行传入的解码参数。
+        """
         print("\n" + "="*80)
         print("  🎵 T5歌单生成模型 - 交互式演示 🎵")
         print("="*80)
         constraint_mode = "Trie树约束" if self.use_trie_constraint else "无约束"
-        print(f"  推理模式: {constraint_mode}采样推理 (使用配置文件中的固定种子)")
+        
+        # 从kwargs获取解码设置用于显示
+        do_sample = kwargs.get('do_sample', False)
+        if do_sample:
+            decode_strategy = f"采样 (Temp: {kwargs.get('temperature', 1.0)}, Top-K: {kwargs.get('top_k', 50)}, Top-P: {kwargs.get('top_p', 1.0)})"
+        else:
+            num_beams = kwargs.get('num_beams', 1)
+            decode_strategy = f"Beam Search (Beams: {num_beams})" if num_beams > 1 else "Greedy Search"
+
+        print(f"  推理模式: {constraint_mode} + {decode_strategy}")
         print("  命令: 'exit' 或 'quit' 退出程序")
         print("-"*80)
 
@@ -329,7 +357,7 @@ class PlaylistGenerator:
                     continue
 
                 print("\n🎼 生成中，请稍候...")
-                results = self.generate(prompt)
+                results = self.generate(prompt, **kwargs)
 
                 if not results:
                     print("❌ 模型未能生成有效的歌曲列表，请尝试更换标题或描述。")
@@ -386,12 +414,6 @@ if __name__ == "__main__":
         help="最大生成歌曲数量 (默认: 20)"
     )
     parser.add_argument(
-        "-t", "--temperature", 
-        type=float, 
-        default=0.8,
-        help="采样温度 (默认: 0.8)"
-    )
-    parser.add_argument(
         "-l", "--log_level", 
         type=str, 
         default="INFO",
@@ -402,6 +424,37 @@ if __name__ == "__main__":
         "--no_trie_constraint",
         action="store_true",
         help="禁用Trie树约束生成（默认启用）"
+    )
+
+    # --- New Decoding Strategy Arguments ---
+    parser.add_argument(
+        "--do_sample",
+        action="store_true",
+        help="启用采样模式 (默认禁用，与beam search互斥)"
+    )
+    parser.add_argument(
+        "--num_beams",
+        type=int,
+        default=1,
+        help="Beam search的beam数量 (默认: 1, 表示Greedy Search)"
+    )
+    parser.add_argument(
+        "-t", "--temperature", 
+        type=float, 
+        default=1.0,
+        help="采样温度 (仅在--do_sample时生效, 默认: 1.0)"
+    )
+    parser.add_argument(
+        "--top_k",
+        type=int,
+        default=50,
+        help="Top-k采样 (仅在--do_sample时生效, 默认: 50)"
+    )
+    parser.add_argument(
+        "--top_p",
+        type=float,
+        default=1.0,
+        help="Top-p (nucleus)采样 (仅在--do_sample时生效, 默认: 1.0)"
     )
     
     args = parser.parse_args()
@@ -426,7 +479,11 @@ if __name__ == "__main__":
         results = generator.generate(
             args.prompt, 
             max_songs=args.max_songs,
-            temperature=args.temperature
+            do_sample=args.do_sample,
+            num_beams=args.num_beams,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            top_p=args.top_p
         )
         
         if results:
@@ -446,8 +503,16 @@ if __name__ == "__main__":
         else:
             print("未能生成有效的歌单，请尝试其他提示文本。")
     else:
-        # 交互模式
-        generator.interactive_demo()
+        # 交互模式 - 注意：交互模式将使用命令行传入的解码参数
+        logger.info("启动交互模式...")
+        logger.info(f"交互会话解码参数: do_sample={args.do_sample}, num_beams={args.num_beams}, temp={args.temperature}, top_k={args.top_k}, top_p={args.top_p}")
+        generator.interactive_demo(
+            do_sample=args.do_sample,
+            num_beams=args.num_beams,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            top_p=args.top_p
+        )
 
 
     

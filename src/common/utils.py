@@ -104,3 +104,40 @@ def setup_logging(log_file: Optional[str] = None, level: int = logging.INFO) -> 
     
     # 返回一个模块级别的logger
     return root_logger
+
+
+def load_song_vectors(path: str) -> dict:
+    """
+    Loads song vectors from a project-standard CSV file.
+
+    Args:
+        path (str): The path to the song vectors file.
+
+    Returns:
+        dict: A dictionary mapping song_id (str) to its vector (np.ndarray).
+    """
+    logger = logging.getLogger(__name__)
+    logger.info(f"Loading song vectors from: {path}")
+    vectors = {}
+    try:
+        from tqdm import tqdm
+        import csv
+        
+        # Get total number of lines for tqdm progress bar
+        with open(path, 'r', encoding='utf-8') as f:
+            total_lines = sum(1 for line in f)
+
+        with open(path, 'r', encoding='utf-8') as f:
+            reader = csv.reader(f)
+            for row in tqdm(reader, total=total_lines, desc="Reading song vectors"):
+                if len(row) > 1:
+                    vectors[row[0]] = np.array(row[1:], dtype=np.float32)
+    except FileNotFoundError:
+        logger.error(f"FATAL: Song vectors file not found at {path}.")
+        return {}
+    except Exception as e:
+        logger.error(f"An error occurred while loading song vectors: {e}")
+        return {}
+    
+    logger.info(f"Successfully loaded {len(vectors)} song vectors.")
+    return vectors

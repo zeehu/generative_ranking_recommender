@@ -1390,6 +1390,54 @@ class HierarchicalRQKMeans:
         
         self.is_trained = len(self.cluster_centers_list) > 0
     
+    def reconstruct_vector_from_id(self, semantic_id: Tuple[int, ...]) -> Optional[torch.Tensor]:
+        """
+        Reconstructs a vector from a given semantic ID.
+
+        NOTE: This is a simplified implementation for quantization error analysis.
+        It currently only reconstructs using the Layer 1 centroid, which represents
+        the most significant part of the vector in a hierarchical quantization scheme.
+        A full reconstruction would require summing the centroids from all layers,
+        which is complex to index correctly with the current model structure.
+
+        Args:
+            semantic_id (Tuple[int, ...]): A tuple representing the semantic ID, e.g., (10, 55, 120).
+
+        Returns:
+            Optional[torch.Tensor]: The reconstructed vector as a torch.Tensor, or None if model is not ready.
+        """
+        if not self.is_trained or not self.cluster_centers_list:
+            logger.warning("Cannot reconstruct vector, model is not trained or loaded.")
+            return None
+        
+        if len(semantic_id) != len(self.cluster_centers_list):
+            logger.warning(f"Semantic ID length {len(semantic_id)} does not match number of layers {len(self.cluster_centers_list)}.")
+            return None
+
+        # Simplified reconstruction: Return the centroid from the first layer.
+        # This gives a measure of the "coarse" quantization error.
+        l1_id = semantic_id[0]
+        l1_centers = self.cluster_centers_list[0]
+
+        if l1_id >= len(l1_centers):
+            logger.warning(f"Layer 1 ID {l1_id} is out of bounds for {len(l1_centers)} centers.")
+            return None
+
+        reconstructed_vector = l1_centers[l1_id]
+        
+        # A full RQ reconstruction would be the sum of centroids from all layers.
+        # Example for full reconstruction (requires complex indexing not implemented here):
+        #
+        # reconstructed_vector = torch.zeros(self.config.embedding_dim, device=self.device)
+        # # Layer 0
+        # reconstructed_vector += self.cluster_centers_list[0][semantic_id[0]]
+        # # Layer 1
+        # l1_raw_index = semantic_id[0] * self.config.need_clusters[1] + semantic_id[1]
+        # reconstructed_vector += self.cluster_centers_list[1][l1_raw_index]
+        # ... and so on for other layers, which is complex.
+        
+        return reconstructed_vector
+
     def get_training_status(self) -> Dict:
         """获取训练状态"""
         if self.checkpoint_manager:

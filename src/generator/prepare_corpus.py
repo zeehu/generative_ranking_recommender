@@ -136,8 +136,11 @@ class CorpusBuilder:
             'total_songs': 0,
             'songs_with_semantic_ids': 0,
             'songs_without_semantic_ids': 0,
+            'original_lengths': [], # New: For sequence length analysis
         }
         
+        max_len = self.t5_config.max_target_length - 1
+
         for glid, songs in tqdm(playlist_songs.items(), desc="Processing playlists"):
             if glid not in playlist_info:
                 stats['playlists_without_info'] += 1
@@ -182,8 +185,10 @@ class CorpusBuilder:
             # If no semantic tokens were found (e.g., all songs filtered out), skip
             if not semantic_tokens:
                 continue
+            
+            # New: Record original length before truncation
+            stats['original_lengths'].append(len(semantic_tokens))
 
-            max_len = self.t5_config.max_target_length - 1
             truncated_tokens = semantic_tokens[:max_len]
             output_sequence = " ".join(truncated_tokens) + " <eos>"
             corpus.append((glid, title, output_sequence))
@@ -196,8 +201,27 @@ class CorpusBuilder:
         logger.info(f"  Playlists without title: {stats['playlists_without_title']}")
         logger.info(f"  Playlists with too few songs: {stats['playlists_too_few_songs']}")
         logger.info(f"  Total songs processed: {stats['total_songs']}")
-        logger.info(f"  Songs with semantic IDs: {stats['songs_with_semantic_ids']} ({stats['songs_with_semantic_ids']/stats['total_songs']*100:.2f}%)")
-        logger.info(f"  Songs without semantic IDs: {stats['songs_without_semantic_ids']} ({stats['songs_without_semantic_ids']/stats['total_songs']*100:.2f}%)")
+        logger.info(f"  Songs with semantic IDs: {stats['songs_with_semantic_ids']} ({stats['songs_with_semantic_ids']/stats['total_songs']*100:.2f}%)" if stats['total_songs'] > 0 else "")
+        logger.info(f"  Songs without semantic IDs: {stats['songs_without_semantic_ids']} ({stats['songs_without_semantic_ids']/stats['total_songs']*100:.2f}%)" if stats['total_songs'] > 0 else "")
+
+        # New: Detailed sequence length analysis
+        if stats['original_lengths']:
+            import numpy as np
+            lengths = np.array(stats['original_lengths'])
+            truncated_count = np.sum(lengths > max_len)
+            
+            logger.info("--- Target Sequence Length Analysis (Before Truncation) ---")
+            logger.info(f"  Total valid playlists: {len(lengths)}")
+            logger.info(f"  Min length: {np.min(lengths)}")
+            logger.info(f"  Max length: {np.max(lengths)}")
+            logger.info(f"  Avg length: {np.mean(lengths):.2f}")
+            logger.info(f"  Median length (50th percentile): {np.median(lengths)}")
+            logger.info(f"  90th percentile: {np.percentile(lengths, 90):.2f}")
+            logger.info(f"  95th percentile: {np.percentile(lengths, 95):.2f}")
+            logger.info(f"  99th percentile: {np.percentile(lengths, 99):.2f}")
+            logger.info("--- Truncation Analysis ---")
+            logger.info(f"  Max allowed length (max_target_length - 1): {max_len}")
+            logger.info(f"  Playlists truncated: {truncated_count} ({truncated_count/len(lengths)*100:.2f}%)")
         
         if len(corpus) == 0:
             logger.error("FATAL: No valid corpus entries generated!")
