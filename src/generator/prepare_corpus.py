@@ -122,11 +122,10 @@ class CorpusBuilder:
         """
         Build text-to-text corpus with layer-specific semantic ID tokens.
         
-        Each semantic ID is represented as <id_l{layer}_{id}> to distinguish
-        which layer the ID belongs to. This allows the T5 model to learn
-        multi-granular semantic information from the three-layer hierarchical IDs.
+        Implements a "chunking" strategy for long playlists to ensure all songs
+        are used for training.
         """
-        logger.info("Building text-to-text corpus...")
+        logger.info("Building text-to-text corpus with chunking strategy...")
         corpus = []
         stats = {
             'total_playlists': len(playlist_songs),
@@ -136,7 +135,8 @@ class CorpusBuilder:
             'total_songs': 0,
             'songs_with_semantic_ids': 0,
             'songs_without_semantic_ids': 0,
-            'original_lengths': [], # New: For sequence length analysis
+            'original_lengths': [], # For sequence length analysis
+            'total_samples_after_chunking': 0,
         }
         
         max_len = self.t5_config.max_target_length - 1
@@ -163,13 +163,11 @@ class CorpusBuilder:
             
             for song_id in sorted_songs:
                 if song_id in semantic_id_map:
-                    # Create layer-specific tokens for each of the three layers
-                    # semantic_ids = [layer1_id, layer2_id, layer3_id]
                     semantic_ids = semantic_id_map[song_id]
                     tokens = [
-                        f"<id_l1_{semantic_ids[0]}>",  # Layer 1 token
-                        f"<id_l2_{semantic_ids[1]}>",  # Layer 2 token
-                        f"<id_l3_{semantic_ids[2]}>",  # Layer 3 token
+                        f"<id_l1_{semantic_ids[0]}>",
+                        f"<id_l2_{semantic_ids[1]}>",
+                        f"<id_l3_{semantic_ids[2]}>",
                     ]
                     semantic_tokens.extend(tokens)
                     songs_with_semantic_ids += 1
@@ -177,26 +175,37 @@ class CorpusBuilder:
                 else:
                     stats['songs_without_semantic_ids'] += 1
             
-            # Filter out playlists with too few songs after semantic ID filtering
             if songs_with_semantic_ids < self.data_config.min_songs_per_playlist:
                 stats['playlists_too_few_songs'] += 1
                 continue
 
-            # If no semantic tokens were found (e.g., all songs filtered out), skip
             if not semantic_tokens:
                 continue
             
-            # New: Record original length before truncation
             stats['original_lengths'].append(len(semantic_tokens))
 
-            truncated_tokens = semantic_tokens[:max_len]
-            output_sequence = " ".join(truncated_tokens) + " <eos>"
-            corpus.append((glid, title, output_sequence))
+            # --- Chunking Logic ---
+            if len(semantic_tokens) <= max_len:
+                # If the sequence is short enough, create one sample.
+                output_sequence = " ".join(semantic_tokens) + " <eos>"
+                corpus.append((glid, title, output_sequence))
+                stats['total_samples_after_chunking'] += 1
+            else:
+                # If the sequence is too long, split it into chunks.
+                for i, chunk_start in enumerate(range(0, len(semantic_tokens), max_len)):
+                    chunk_tokens = semantic_tokens[chunk_start : chunk_start + max_len]
+                    output_sequence = " ".join(chunk_tokens) + " <eos>"
+                    
+                    # Create a unique ID for each chunk to avoid duplicates in TSV
+                    chunk_glid = f"{glid}_chunk_{i}"
+                    corpus.append((chunk_glid, title, output_sequence))
+                    stats['total_samples_after_chunking'] += 1
         
-        logger.info(f"Successfully built corpus with {len(corpus)} entries.")
+        logger.info(f"Successfully built corpus with {stats['total_samples_after_chunking']} entries (after chunking).")
         logger.info("Corpus building statistics:")
-        logger.info(f"  Total playlists: {stats['total_playlists']}")
-        logger.info(f"  Valid corpus entries: {len(corpus)}")
+        logger.info(f"  Total original playlists: {stats['total_playlists']}")
+        logger.info(f"  Valid original playlists: {len(stats['original_lengths'])}")
+        logger.info(f"  Total training samples generated (post-chunking): {stats['total_samples_after_chunking']}")
         logger.info(f"  Playlists without info: {stats['playlists_without_info']}")
         logger.info(f"  Playlists without title: {stats['playlists_without_title']}")
         logger.info(f"  Playlists with too few songs: {stats['playlists_too_few_songs']}")
@@ -204,13 +213,13 @@ class CorpusBuilder:
         logger.info(f"  Songs with semantic IDs: {stats['songs_with_semantic_ids']} ({stats['songs_with_semantic_ids']/stats['total_songs']*100:.2f}%)" if stats['total_songs'] > 0 else "")
         logger.info(f"  Songs without semantic IDs: {stats['songs_without_semantic_ids']} ({stats['songs_without_semantic_ids']/stats['total_songs']*100:.2f}%)" if stats['total_songs'] > 0 else "")
 
-        # New: Detailed sequence length analysis
+        # Detailed sequence length analysis (on original lengths)
         if stats['original_lengths']:
             import numpy as np
             lengths = np.array(stats['original_lengths'])
             truncated_count = np.sum(lengths > max_len)
             
-            logger.info("--- Target Sequence Length Analysis (Before Truncation) ---")
+            logger.info("--- Original Target Sequence Length Analysis (Before Chunking) ---")
             logger.info(f"  Total valid playlists: {len(lengths)}")
             logger.info(f"  Min length: {np.min(lengths)}")
             logger.info(f"  Max length: {np.max(lengths)}")
@@ -219,9 +228,9 @@ class CorpusBuilder:
             logger.info(f"  90th percentile: {np.percentile(lengths, 90):.2f}")
             logger.info(f"  95th percentile: {np.percentile(lengths, 95):.2f}")
             logger.info(f"  99th percentile: {np.percentile(lengths, 99):.2f}")
-            logger.info("--- Truncation Analysis ---")
-            logger.info(f"  Max allowed length (max_target_length - 1): {max_len}")
-            logger.info(f"  Playlists truncated: {truncated_count} ({truncated_count/len(lengths)*100:.2f}%)")
+            logger.info("--- Chunking Impact Analysis ---")
+            logger.info(f"  Max allowed length per chunk: {max_len}")
+            logger.info(f"  Original playlists needing chunking: {truncated_count} ({truncated_count/len(lengths)*100:.2f}%)")
         
         if len(corpus) == 0:
             logger.error("FATAL: No valid corpus entries generated!")

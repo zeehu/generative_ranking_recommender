@@ -24,7 +24,7 @@ class DataConfig:
     # Data split ratios for training/validation/test
     train_split_ratio: float = 0.98
     val_split_ratio: float = 0.01
-    min_songs_per_playlist: int = 10 # Minimum number of songs required in a playlist after filtering by semantic ID availability
+    min_songs_per_playlist: int = 5 # Minimum number of songs required in a playlist after filtering by semantic ID availability
 
 @dataclass
 class Word2VecConfig:
