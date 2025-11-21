@@ -155,7 +155,9 @@ class CorpusBuilder:
                 continue
 
             # Per our "embrace collision" strategy, we do not de-duplicate songs or tokens here.
-            sorted_songs = sorted(songs)
+            # MODIFIED: Use random shuffle instead of sorting to prevent model from learning artificial ID order
+            sorted_songs = list(songs)
+            random.shuffle(sorted_songs)
             semantic_tokens = []
             songs_with_semantic_ids = 0 # Count songs that actually have semantic IDs
             

@@ -41,14 +41,14 @@ PROMPT_TEMPLATE = """你是一名专业的音乐策划和数据分析师。你�
 
 **输出示例：**
 [
-  {
+  {{
     "id": "12345",
     "classification": "Good"
-  },
-  {
+  }},
+  {{
     "id": "67890",
     "classification": "Bad"
-  }
+  }}
 ]
 
 **待分类歌单标题：**
