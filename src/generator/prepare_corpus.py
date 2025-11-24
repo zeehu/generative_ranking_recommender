@@ -1,5 +1,5 @@
 """
-Step G2: Generate Training Corpus for the T5 Generator Model.   
+Step G2: Generate Training Corpus for the T5 Generator Model.    
 
 This script reads the raw playlist data, combines it with the generated
 semantic IDs (song-to-cluster map), and produces train/val/test splits
@@ -34,7 +34,8 @@ class CorpusBuilder:
         semantic_id_map = self._load_semantic_ids()
         playlist_info = self._load_playlist_info()
         playlist_songs = self._load_playlist_songs()
-        corpus = self._build_corpus(playlist_info, playlist_songs, semantic_id_map)
+        playlist_filter = self._load_playlist_filter()
+        corpus = self._build_corpus(playlist_info, playlist_songs, semantic_id_map, playlist_filter)
         self._split_and_save(corpus)
         logger.info("--- Step G2 Completed Successfully ---")
 
@@ -118,12 +119,80 @@ class CorpusBuilder:
             logger.error(f"FATAL: Playlist songs file not found at {self.data_config.playlist_songs_file}")
             sys.exit(1)
 
-    def _build_corpus(self, playlist_info: dict, playlist_songs: dict, semantic_id_map: dict) -> list:
+    def _load_playlist_filter(self) -> dict:
+        """
+        Load playlist filter data from llm_filter_prompts.parse_res.
+        Returns a dict mapping playlist_id to quality label (Good/Bad/N/A).
+        
+        File format: <label>\t<playlist_id>\t<title>\t<description>
+        Example:
+        Good    collection_1_1005752747_558564_0        黑执事专辑      明确指出了影视作品和音乐类型
+        Bad     collection_1_1005942407_742147_0        嗨嗨嗨海海海    无意义的重复和无描述性
+        """
+        filter_file = os.path.join(self.data_config.data_dir, 'llm_filter_prompts.parse_res')
+        logger.info(f"Loading playlist filter data from {filter_file}...")
+        
+        if not os.path.exists(filter_file):
+            logger.warning(f"Playlist filter file not found at {filter_file}. Skipping filtering.")
+            return {}
+        
+        playlist_filter = {}
+        line_count = 0
+        error_count = 0
+        
+        try:
+            with open(filter_file, 'r', encoding='utf-8') as f:
+                for line_num, line in enumerate(f, 1):
+                    line_count += 1
+                    line = line.strip()
+                    if not line:
+                        continue
+                    
+                    try:
+                        parts = line.split('\t')
+                        if len(parts) < 2:
+                            logger.warning(f"Line {line_num}: Invalid format (expected at least 2 tab-separated fields)")
+                            error_count += 1
+                            continue
+                        
+                        label = parts[0].strip()
+                        playlist_id = parts[1].strip()
+                        
+                        if label not in ['Good', 'Bad', 'N/A']:
+                            logger.warning(f"Line {line_num}: Unknown label '{label}' for playlist {playlist_id}")
+                            error_count += 1
+                            continue
+                        
+                        playlist_filter[playlist_id] = label
+                    except Exception as e:
+                        logger.warning(f"Line {line_num}: Error parsing line - {e}")
+                        error_count += 1
+                        continue
+            
+            logger.info(f"Loaded filter data for {len(playlist_filter)} playlists from {line_count} lines.")
+            if error_count > 0:
+                logger.warning(f"Encountered {error_count} errors while loading filter data")
+            
+            # Log statistics
+            good_count = sum(1 for label in playlist_filter.values() if label == 'Good')
+            bad_count = sum(1 for label in playlist_filter.values() if label == 'Bad')
+            na_count = sum(1 for label in playlist_filter.values() if label == 'N/A')
+            logger.info(f"Filter statistics: Good={good_count}, Bad={bad_count}, N/A={na_count}")
+            
+        except Exception as e:
+            logger.error(f"Error loading playlist filter file: {e}")
+            return {}
+        
+        return playlist_filter
+
+    def _build_corpus(self, playlist_info: dict, playlist_songs: dict, semantic_id_map: dict, playlist_filter: dict) -> list:
         """
         Build text-to-text corpus with layer-specific semantic ID tokens.
         
         Implements a "chunking" strategy for long playlists to ensure all songs
         are used for training.
+        
+        Filters out playlists marked as 'Bad' or 'N/A' in the playlist_filter.
         """
         logger.info("Building text-to-text corpus with chunking strategy...")
         corpus = []
@@ -132,6 +201,8 @@ class CorpusBuilder:
             'playlists_without_info': 0,
             'playlists_without_title': 0,
             'playlists_too_few_songs': 0,
+            'playlists_filtered_bad': 0,
+            'playlists_filtered_na': 0,
             'total_songs': 0,
             'songs_with_semantic_ids': 0,
             'songs_without_semantic_ids': 0,
@@ -142,6 +213,17 @@ class CorpusBuilder:
         max_len = self.t5_config.max_target_length - 1
 
         for glid, songs in tqdm(playlist_songs.items(), desc="Processing playlists"):
+            # Filter out playlists marked as 'Bad' or 'N/A'
+            if playlist_filter:
+                if glid in playlist_filter:
+                    label = playlist_filter[glid]
+                    if label == 'Bad':
+                        stats['playlists_filtered_bad'] += 1
+                        continue
+                    elif label == 'N/A':
+                        stats['playlists_filtered_na'] += 1
+                        continue
+            
             if glid not in playlist_info:
                 stats['playlists_without_info'] += 1
                 continue
@@ -206,6 +288,8 @@ class CorpusBuilder:
         logger.info(f"  Total original playlists: {stats['total_playlists']}")
         logger.info(f"  Valid original playlists: {len(stats['original_lengths'])}")
         logger.info(f"  Total training samples generated (post-chunking): {stats['total_samples_after_chunking']}")
+        logger.info(f"  Playlists filtered (Bad): {stats['playlists_filtered_bad']}")
+        logger.info(f"  Playlists filtered (N/A): {stats['playlists_filtered_na']}")
         logger.info(f"  Playlists without info: {stats['playlists_without_info']}")
         logger.info(f"  Playlists without title: {stats['playlists_without_title']}")
         logger.info(f"  Playlists with too few songs: {stats['playlists_too_few_songs']}")

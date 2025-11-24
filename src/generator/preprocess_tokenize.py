@@ -74,7 +74,7 @@ def init_worker(model_name: str, layer_vocab_sizes: dict):
     初始化worker进程的tokenizer（每个进程一个独立的tokenizer）
     """
     global worker_tokenizer
-    from src.generator.tiger_model_new import TIGERTokenizer
+    from src.generator.tiger_model import TIGERTokenizer
     worker_tokenizer = TIGERTokenizer(base_model=model_name, layer_vocab_sizes=layer_vocab_sizes)
 
 
@@ -93,6 +93,30 @@ def count_semantic_ids(text: str) -> int:
     matches = re.findall(pattern, text)
     return len(matches)
 
+def clean_special_symbols(text: str) -> str:
+    """
+    清理文本中的特殊符号，将 @xxx@ 格式的符号替换为空格
+    
+    Args:
+        text: 原始文本，可能包含 @BI_ROW_SPLIT@ 等特殊符号
+    
+    Returns:
+        清理后的文本
+    
+    Examples:
+        >>> clean_special_symbols("歌单@BI_ROW_SPLIT@标题")
+        "歌单 标题"
+        >>> clean_special_symbols("@START@测试@END@文本@BI_ROW_SPLIT@")
+        "测试 文本"
+    """
+    # 匹配 @xxx@ 格式的特殊符号（@ 包裹的任意内容）
+    pattern = r' @BI[^@]+@ '
+    cleaned_text = re.sub(pattern, ' ', text)
+    
+    # 清理多余的空格
+    cleaned_text = re.sub(r'\s+', ' ', cleaned_text).strip()
+    
+    return cleaned_text
 
 def tokenize_chunk_worker(args: Tuple[List[str], List[str], int, int, int, str]) -> Tuple[str, int]:
     """
@@ -228,6 +252,7 @@ def read_and_split_data(data_path: str, chunk_size: int) -> List[Tuple[List[str]
     input_texts = []
     target_texts = []
     total_lines = 0
+    cleaned_count = 0  # 统计清理的样本数
     
     # 使用大缓冲区加速读取
     with open(data_path, 'r', encoding='utf-8', buffering=32*1024*1024) as f:  # 32MB缓冲
@@ -237,6 +262,11 @@ def read_and_split_data(data_path: str, chunk_size: int) -> List[Tuple[List[str]
                 continue
             
             glid, input_text, target_text = parts
+            original_input = input_text
+            input_text = clean_special_symbols(input_text)
+            # 统计清理次数
+            if original_input != input_text:
+                cleaned_count += 1
             input_texts.append(input_text)
             target_texts.append(target_text)
             total_lines += 1
@@ -251,6 +281,7 @@ def read_and_split_data(data_path: str, chunk_size: int) -> List[Tuple[List[str]
         chunks.append((input_texts, target_texts))
     
     logger.info(f"总样本数: {total_lines:,}")
+    logger.info(f"清理特殊符号的样本数: {cleaned_count:,} ({cleaned_count/total_lines*100:.2f}%)" if total_lines > 0 else "清理特殊符号的样本数: 0")
     logger.info(f"分割成 {len(chunks)} 个chunks")
     
     return chunks
