@@ -1,5 +1,5 @@
 """
-Step G2: Generate Training Corpus for the T5 Generator Model.    
+Step G2: Generate Training Corpus for the T5 Generator Model.        
 
 This script reads the raw playlist data, combines it with the generated
 semantic IDs (song-to-cluster map), and produces train/val/test splits
@@ -12,13 +12,14 @@ import json
 from tqdm import tqdm
 import logging
 import random
+import re
 
 # Add project root to sys.path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-from config import Config
+from config_optimized import Config
 from src.common.utils import setup_logging
 
 logger = logging.getLogger(__name__)
@@ -30,19 +31,23 @@ class CorpusBuilder:
         self.t5_config = config.generator_t5
 
     def run(self):
-        logger.info("--- Starting Step G2: Generator Corpus Generation ---")
+        logger.info("--- 开始步骤 G2: 生成器语料库生成 ---")
+        # Set seed at the beginning for reproducibility
+        random.seed(self.config.seed)
+        logger.info(f"随机种子已设置为 {self.config.seed} 以确保数据处理的可重复性")
+        
         semantic_id_map = self._load_semantic_ids()
         playlist_info = self._load_playlist_info()
         playlist_songs = self._load_playlist_songs()
         playlist_filter = self._load_playlist_filter()
         corpus = self._build_corpus(playlist_info, playlist_songs, semantic_id_map, playlist_filter)
         self._split_and_save(corpus)
-        logger.info("--- Step G2 Completed Successfully ---")
+        logger.info("--- 步骤 G2 成功完成 ---")
 
     def _load_semantic_ids(self) -> dict:
-        logger.info(f"Loading semantic IDs from {self.data_config.semantic_ids_file}...")
+        logger.info(f"正在从 {self.data_config.semantic_ids_file} 加载语义ID...")
         if not os.path.exists(self.data_config.semantic_ids_file):
-            logger.error(f"FATAL: Semantic ID file not found. Please run Step G1 first.")
+            logger.error(f"致命错误: 未找到语义ID文件。请先运行步骤 G1。")
             sys.exit(1)
         
         mapping = {}
@@ -55,44 +60,44 @@ class CorpusBuilder:
                 try:
                     item = json.loads(line.strip())
                     if 'song_id' not in item or 'semantic_ids' not in item:
-                        logger.warning(f"Line {line_num}: Missing required fields")
+                        logger.warning(f"第 {line_num} 行: 缺少必需字段")
                         error_count += 1
                         continue
                     
                     semantic_ids = item['semantic_ids']
                     if not isinstance(semantic_ids, list) or len(semantic_ids) != 3:
-                        logger.warning(f"Line {line_num}: Invalid semantic_ids format (expected list of 3 integers)")
+                        logger.warning(f"第 {line_num} 行: 无效的 semantic_ids 格式 (期望包含3个整数的列表)")
                         error_count += 1
                         continue
                     
                     mapping[item['song_id']] = semantic_ids
                 except json.JSONDecodeError as e:
-                    logger.warning(f"Line {line_num}: JSON decode error - {e}")
+                    logger.warning(f"第 {line_num} 行: JSON 解码错误 - {e}")
                     error_count += 1
                     continue
         
-        logger.info(f"Loaded {len(mapping)} song-to-semantic-ID mappings from {line_count} lines.")
+        logger.info(f"从 {line_count} 行中加载了 {len(mapping)} 个歌曲到语义ID的映射。")
         if error_count > 0:
-            logger.warning(f"Encountered {error_count} errors while loading semantic IDs")
+            logger.warning(f"加载语义ID时遇到 {error_count} 个错误")
         
         if len(mapping) == 0:
-            logger.error("FATAL: No valid semantic IDs loaded!")
+            logger.error("致命错误: 未加载到有效的语义ID!")
             sys.exit(1)
         
         return mapping
 
     def _load_playlist_info(self) -> dict:
-        logger.info(f"Loading playlist info from {self.data_config.playlist_info_file}...")
+        logger.info(f"正在从 {self.data_config.playlist_info_file} 加载歌单信息...")
         try:
             df = pd.read_csv(self.data_config.playlist_info_file, sep='\t')
             df.set_index('glid', inplace=True)
             return df.to_dict('index')
         except FileNotFoundError:
-            logger.error(f"FATAL: Playlist info file not found at {self.data_config.playlist_info_file}")
+            logger.error(f"致命错误: 在 {self.data_config.playlist_info_file} 未找到歌单信息文件")
             sys.exit(1)
 
     def _load_playlist_songs(self) -> dict:
-        logger.info(f"Loading playlist songs from {self.data_config.playlist_songs_file}...")
+        logger.info(f"正在从 {self.data_config.playlist_songs_file} 加载歌单歌曲...")
         try:
             # Use chunked reading for better memory efficiency with large files
             chunk_size = 1000000
@@ -113,10 +118,10 @@ class CorpusBuilder:
                     else:
                         playlist_songs[playlist_id] = songs
             
-            logger.info(f"Loaded {len(playlist_songs)} playlists")
+            logger.info(f"已加载 {len(playlist_songs)} 个歌单")
             return playlist_songs
         except FileNotFoundError:
-            logger.error(f"FATAL: Playlist songs file not found at {self.data_config.playlist_songs_file}")
+            logger.error(f"致命错误: 在 {self.data_config.playlist_songs_file} 未找到歌单歌曲文件")
             sys.exit(1)
 
     def _load_playlist_filter(self) -> dict:
@@ -130,10 +135,10 @@ class CorpusBuilder:
         Bad     collection_1_1005942407_742147_0        嗨嗨嗨海海海    无意义的重复和无描述性
         """
         filter_file = os.path.join(self.data_config.data_dir, 'llm_filter_prompts.parse_res')
-        logger.info(f"Loading playlist filter data from {filter_file}...")
+        logger.info(f"正在从 {filter_file} 加载歌单过滤数据...")
         
         if not os.path.exists(filter_file):
-            logger.warning(f"Playlist filter file not found at {filter_file}. Skipping filtering.")
+            logger.warning(f"在 {filter_file} 未找到歌单过滤文件。跳过过滤。")
             return {}
         
         playlist_filter = {}
@@ -151,7 +156,7 @@ class CorpusBuilder:
                     try:
                         parts = line.split('\t')
                         if len(parts) < 2:
-                            logger.warning(f"Line {line_num}: Invalid format (expected at least 2 tab-separated fields)")
+                            logger.warning(f"第 {line_num} 行: 无效格式 (期望至少2个制表符分隔的字段)")
                             error_count += 1
                             continue
                         
@@ -159,28 +164,28 @@ class CorpusBuilder:
                         playlist_id = parts[1].strip()
                         
                         if label not in ['Good', 'Bad', 'N/A']:
-                            logger.warning(f"Line {line_num}: Unknown label '{label}' for playlist {playlist_id}")
+                            logger.warning(f"第 {line_num} 行: 歌单 {playlist_id} 的标签 '{label}' 未知")
                             error_count += 1
                             continue
                         
                         playlist_filter[playlist_id] = label
                     except Exception as e:
-                        logger.warning(f"Line {line_num}: Error parsing line - {e}")
+                        logger.warning(f"第 {line_num} 行: 解析行时出错 - {e}")
                         error_count += 1
                         continue
             
-            logger.info(f"Loaded filter data for {len(playlist_filter)} playlists from {line_count} lines.")
+            logger.info(f"从 {line_count} 行中加载了 {len(playlist_filter)} 个歌单的过滤数据。")
             if error_count > 0:
-                logger.warning(f"Encountered {error_count} errors while loading filter data")
+                logger.warning(f"加载过滤数据时遇到 {error_count} 个错误")
             
             # Log statistics
             good_count = sum(1 for label in playlist_filter.values() if label == 'Good')
             bad_count = sum(1 for label in playlist_filter.values() if label == 'Bad')
             na_count = sum(1 for label in playlist_filter.values() if label == 'N/A')
-            logger.info(f"Filter statistics: Good={good_count}, Bad={bad_count}, N/A={na_count}")
+            logger.info(f"过滤统计: Good={good_count}, Bad={bad_count}, N/A={na_count}")
             
         except Exception as e:
-            logger.error(f"Error loading playlist filter file: {e}")
+            logger.error(f"加载歌单过滤文件时出错: {e}")
             return {}
         
         return playlist_filter
@@ -194,7 +199,7 @@ class CorpusBuilder:
         
         Filters out playlists marked as 'Bad' or 'N/A' in the playlist_filter.
         """
-        logger.info("Building text-to-text corpus with chunking strategy...")
+        logger.info("正在使用分块策略构建文本到文本语料库...")
         corpus = []
         stats = {
             'total_playlists': len(playlist_songs),
@@ -212,7 +217,7 @@ class CorpusBuilder:
         
         max_len = self.t5_config.max_target_length - 1
 
-        for glid, songs in tqdm(playlist_songs.items(), desc="Processing playlists"):
+        for glid, songs in tqdm(playlist_songs.items(), desc="处理歌单中"):
             # Filter out playlists marked as 'Bad' or 'N/A'
             if playlist_filter:
                 if glid in playlist_filter:
@@ -232,6 +237,13 @@ class CorpusBuilder:
                 continue
 
             title = playlist_info[glid].get('listname', '')
+            # Ensure title is a string (handle NaN or other non-string types)
+            if pd.isna(title) or not isinstance(title, str):
+                title = ''
+            # Clean special identifiers from title (remove text wrapped in @...@)
+            title = re.sub(r'@BI[^@]+@', '', title).strip()
+            # Merge multiple consecutive spaces into a single space
+            title = re.sub(r'\s+', ' ', title).strip()
             if not title:
                 stats['playlists_without_title'] += 1
                 continue
@@ -285,19 +297,19 @@ class CorpusBuilder:
                     corpus.append((chunk_glid, title, output_sequence))
                     stats['total_samples_after_chunking'] += 1
         
-        logger.info(f"Successfully built corpus with {stats['total_samples_after_chunking']} entries (after chunking).")
-        logger.info("Corpus building statistics:")
-        logger.info(f"  Total original playlists: {stats['total_playlists']}")
-        logger.info(f"  Valid original playlists: {len(stats['original_lengths'])}")
-        logger.info(f"  Total training samples generated (post-chunking): {stats['total_samples_after_chunking']}")
-        logger.info(f"  Playlists filtered (Bad): {stats['playlists_filtered_bad']}")
-        logger.info(f"  Playlists filtered (N/A): {stats['playlists_filtered_na']}")
-        logger.info(f"  Playlists without info: {stats['playlists_without_info']}")
-        logger.info(f"  Playlists without title: {stats['playlists_without_title']}")
-        logger.info(f"  Playlists with too few songs: {stats['playlists_too_few_songs']}")
-        logger.info(f"  Total songs processed: {stats['total_songs']}")
-        logger.info(f"  Songs with semantic IDs: {stats['songs_with_semantic_ids']} ({stats['songs_with_semantic_ids']/stats['total_songs']*100:.2f}%)" if stats['total_songs'] > 0 else "")
-        logger.info(f"  Songs without semantic IDs: {stats['songs_without_semantic_ids']} ({stats['songs_without_semantic_ids']/stats['total_songs']*100:.2f}%)" if stats['total_songs'] > 0 else "")
+        logger.info(f"成功构建了包含 {stats['total_samples_after_chunking']} 条记录的语料库 (分块后)。")
+        logger.info("语料库构建统计:")
+        logger.info(f"  原始歌单总数: {stats['total_playlists']}")
+        logger.info(f"  有效原始歌单数: {len(stats['original_lengths'])}")
+        logger.info(f"  生成的训练样本总数 (分块后): {stats['total_samples_after_chunking']}")
+        logger.info(f"  过滤的歌单 (Bad): {stats['playlists_filtered_bad']}")
+        logger.info(f"  过滤的歌单 (N/A): {stats['playlists_filtered_na']}")
+        logger.info(f"  无信息的歌单: {stats['playlists_without_info']}")
+        logger.info(f"  无标题的歌单: {stats['playlists_without_title']}")
+        logger.info(f"  歌曲数过少的歌单: {stats['playlists_too_few_songs']}")
+        logger.info(f"  处理的歌曲总数: {stats['total_songs']}")
+        logger.info(f"  有语义ID的歌曲: {stats['songs_with_semantic_ids']} ({stats['songs_with_semantic_ids']/stats['total_songs']*100:.2f}%)" if stats['total_songs'] > 0 else "")
+        logger.info(f"  无语义ID的歌曲: {stats['songs_without_semantic_ids']} ({stats['songs_without_semantic_ids']/stats['total_songs']*100:.2f}%)" if stats['total_songs'] > 0 else "")
 
         # Detailed sequence length analysis (on original lengths)
         if stats['original_lengths']:
@@ -305,29 +317,28 @@ class CorpusBuilder:
             lengths = np.array(stats['original_lengths'])
             truncated_count = np.sum(lengths > max_len)
             
-            logger.info("--- Original Target Sequence Length Analysis (Before Chunking) ---")
-            logger.info(f"  Total valid playlists: {len(lengths)}")
-            logger.info(f"  Min length: {np.min(lengths)}")
-            logger.info(f"  Max length: {np.max(lengths)}")
-            logger.info(f"  Avg length: {np.mean(lengths):.2f}")
-            logger.info(f"  Median length (50th percentile): {np.median(lengths)}")
-            logger.info(f"  90th percentile: {np.percentile(lengths, 90):.2f}")
-            logger.info(f"  95th percentile: {np.percentile(lengths, 95):.2f}")
-            logger.info(f"  99th percentile: {np.percentile(lengths, 99):.2f}")
-            logger.info("--- Chunking Impact Analysis ---")
-            logger.info(f"  Max allowed length per chunk: {max_len}")
-            logger.info(f"  Original playlists needing chunking: {truncated_count} ({truncated_count/len(lengths)*100:.2f}%)")
+            logger.info("--- 原始目标序列长度分析 (分块前) ---")
+            logger.info(f"  有效歌单总数: {len(lengths)}")
+            logger.info(f"  最小长度: {np.min(lengths)}")
+            logger.info(f"  最大长度: {np.max(lengths)}")
+            logger.info(f"  平均长度: {np.mean(lengths):.2f}")
+            logger.info(f"  中位数长度 (第50百分位): {np.median(lengths)}")
+            logger.info(f"  第90百分位: {np.percentile(lengths, 90):.2f}")
+            logger.info(f"  第95百分位: {np.percentile(lengths, 95):.2f}")
+            logger.info(f"  第99百分位: {np.percentile(lengths, 99):.2f}")
+            logger.info("--- 分块影响分析 ---")
+            logger.info(f"  每个分块允许的最大长度: {max_len}")
+            logger.info(f"  需要分块的原始歌单数: {truncated_count} ({truncated_count/len(lengths)*100:.2f}%)")
         
         if len(corpus) == 0:
-            logger.error("FATAL: No valid corpus entries generated!")
+            logger.error("致命错误: 未生成有效的语料库条目!")
             sys.exit(1)
         
         return corpus
 
     def _split_and_save(self, corpus: list):
-        logger.info("Splitting data and saving to files...")
-        # Set seed for reproducible splits
-        random.seed(self.config.seed)
+        logger.info("正在拆分数据并保存到文件...")
+        # Shuffle corpus for random split (seed already set in run())
         random.shuffle(corpus)
         train_ratio = self.data_config.train_split_ratio
         val_ratio = self.data_config.val_split_ratio
@@ -341,13 +352,13 @@ class CorpusBuilder:
         val_data = corpus[train_end_idx:val_end_idx]
         test_data = corpus[val_end_idx:] # Remaining data for test
 
-        logger.info(f"Data split: {len(train_data)} train, {len(val_data)} validation, {len(test_data)} test.")
+        logger.info(f"数据拆分: {len(train_data)} 训练集, {len(val_data)} 验证集, {len(test_data)} 测试集。")
         
         # Validate split ratios
         if len(val_data) == 0:
-            logger.warning("Validation set is empty! Consider adjusting split ratios.")
+            logger.warning("验证集为空! 请考虑调整拆分比例。")
         if len(test_data) == 0:
-            logger.warning("Test set is empty! Consider adjusting split ratios.")
+            logger.warning("测试集为空! 请考虑调整拆分比例。")
         
         output_dir = os.path.join(self.config.output_dir, "generator")
         os.makedirs(output_dir, exist_ok=True)
@@ -356,7 +367,7 @@ class CorpusBuilder:
         self._save_to_tsv(test_data, os.path.join(output_dir, "test.tsv"))
 
     def _save_to_tsv(self, data: list, file_path: str):
-        logger.info(f"Saving {len(data)} records to {file_path}...")
+        logger.info(f"正在保存 {len(data)} 条记录到 {file_path}...")
         with open(file_path, 'w', encoding='utf-8') as f:
             for glid, input_text, output_sequence in data:
                 f.write(f"{glid}\t{input_text}\t{output_sequence}\n")
