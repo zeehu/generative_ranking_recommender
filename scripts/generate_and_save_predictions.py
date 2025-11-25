@@ -37,19 +37,19 @@ def main():
     parser.add_argument(
         "--output_file", 
         type=str, 
-        default="outputs/predictions_with_details.txt",
+        default="outputs/predictions_with_details_beam.txt",
         help="Output file path"
     )
     parser.add_argument(
         "--model_path", 
         type=str, 
-        default=None,
+        default=“models/generator/final_model/”,
         help="Model path"
     )
     parser.add_argument(
         "--sample_size", 
         type=int, 
-        default=None,
+        default=1000,
         help="Number of queries to sample (default: all)"
     )
     parser.add_argument(
@@ -63,6 +63,7 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.7, help="Temperature for sampling")
     parser.add_argument("--top_k", type=int, default=50, help="Top-k for sampling")
     parser.add_argument("--top_p", type=float, default=0.9, help="Top-p for sampling")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     
     args = parser.parse_args()
     
