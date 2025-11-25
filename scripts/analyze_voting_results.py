@@ -602,11 +602,18 @@ def main():
         help="日志级别（默认INFO）"
     )
     
+    parser.add_argument(
+        "--log_file",
+        type=str,
+        default='logs/analyze_voting_results.log',
+        help="日志输出文件路径"
+    )
+    
     args = parser.parse_args()
     
     # 设置日志
     log_level = getattr(logging, args.log_level)
-    setup_logging(level=log_level)
+    setup_logging(log_file=args.log_file, level=log_level)
     
     # 设置随机种子
     random.seed(args.seed)

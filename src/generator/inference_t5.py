@@ -233,6 +233,67 @@ class PlaylistGenerator:
         
         logger.debug(f"生成的token (前50个): {decoded_tokens[:50]}...")
 
+        results = self._process_generated_tokens(decoded_tokens, max_songs)
+        return results
+
+    def generate_batch(self, titles: List[str], max_songs: int = 20, 
+                       do_sample: bool = False, num_beams: int = 1, temperature: float = 1.0, 
+                       top_k: int = 50, top_p: float = 1.0) -> List[List[Dict]]:
+        """
+        批量生成歌单。
+        """
+        logger.info(f"正在批量生成歌单，批次大小: {len(titles)}")
+
+        # Tokenize batch
+        input_encodings = self.model.tokenizer.base_tokenizer(
+            titles, 
+            return_tensors="pt",
+            max_length=self.config.generator_t5.max_input_length,
+            truncation=True,
+            padding=True
+        ).to(self.device)
+
+        input_ids = input_encodings.input_ids
+        attention_mask = input_encodings.attention_mask
+
+        gen_kwargs = {
+            "max_new_tokens": self.config.generator_t5.max_target_length,
+            "pad_token_id": self.model.tokenizer.pad_token_id,
+            "num_return_sequences": 1,
+        }
+
+        if do_sample:
+            gen_kwargs["do_sample"] = True
+            gen_kwargs["top_k"] = top_k
+            gen_kwargs["top_p"] = top_p
+            gen_kwargs["temperature"] = temperature
+        else:
+            gen_kwargs["do_sample"] = False
+            gen_kwargs["num_beams"] = num_beams
+        
+        if self.use_trie_constraint and self.constrained_processor is not None:
+            gen_kwargs["logits_processor"] = [self.constrained_processor]
+
+        with torch.no_grad():
+            generated_ids = self.model.model.generate(
+                input_ids=input_ids, 
+                attention_mask=attention_mask,
+                **gen_kwargs
+            )
+        
+        batch_results = []
+        for i in range(len(titles)):
+            decoded_tokens = self.model.tokenizer.base_tokenizer.convert_ids_to_tokens(
+                generated_ids[i], 
+                skip_special_tokens=False
+            )
+            results = self._process_generated_tokens(decoded_tokens, max_songs)
+            batch_results.append(results)
+            
+        return batch_results
+
+    def _process_generated_tokens(self, decoded_tokens: List[str], max_songs: int) -> List[Dict]:
+        """处理生成的token序列，提取语义ID并映射为歌曲"""
         semantic_id_tuples = []
         i = 0
         while i < len(decoded_tokens):
@@ -254,20 +315,15 @@ class PlaylistGenerator:
                             pass
             i += 1
         
-        logger.info(f"提取了 {len(semantic_id_tuples)} 个语义ID元组 (包含重复)")
-        
         # 如果使用了Trie树约束，验证生成的语义ID是否都有效
         if self.use_trie_constraint and self.trie is not None:
             invalid_count = 0
             for id_tuple in semantic_id_tuples:
                 if id_tuple not in self.trie.valid_semantic_ids:
                     invalid_count += 1
-                    logger.debug(f"检测到无效的语义ID: {id_tuple}")
             
             if invalid_count > 0:
                 logger.warning(f"生成了 {invalid_count} 个无效的语义ID（共{len(semantic_id_tuples)}个）")
-            else:
-                logger.info(f"所有生成的语义ID都是有效的！")
 
         id_stats = {}
         for i, id_tuple in enumerate(semantic_id_tuples):
@@ -281,11 +337,6 @@ class PlaylistGenerator:
             key=lambda item: (-item[1]['count'], item[1]['first_index'])
         )
         
-        logger.debug("--- [DEBUG] 排序后的语义ID生成次数 (Top 10) ---")
-        for id_tuple, stats in sorted_stats[:10]:
-            logger.debug(f"ID: {id_tuple}, 生成次数: {stats['count']}, 首次出现位置: {stats['first_index']}")
-        logger.debug("-------------------------------------------")
-
         results = []
         for id_tuple, stats in sorted_stats:
             if id_tuple in self.semantic_to_song_cluster:
@@ -312,10 +363,7 @@ class PlaylistGenerator:
 
                 if len(results) >= max_songs:
                     break
-            else:
-                logger.debug(f"语义ID {id_tuple} 在簇映射中未找到")
         
-        logger.info(f"构建了 {len(results)} 条结构化推荐结果")
         return results
 
     def _format_song_string(self, song_id: str, song_info: dict) -> str:
