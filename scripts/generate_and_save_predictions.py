@@ -43,7 +43,7 @@ def main():
     parser.add_argument(
         "--model_path", 
         type=str, 
-        default=“models/generator/final_model/”,
+        default="models/generator/final_model/",
         help="Model path"
     )
     parser.add_argument(
