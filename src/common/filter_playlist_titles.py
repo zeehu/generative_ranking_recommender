@@ -18,7 +18,7 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-from config import Config
+from config_optimized import Config
 from src.common.utils import setup_logging
 
 logger = setup_logging()
