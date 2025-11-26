@@ -1,6 +1,6 @@
 """
-Generate predictions using T5 model and save detailed song information.
-OPTIMIZED VERSION: Supports Multi-GPU Data Parallelism for faster inference.
+Generate predictions using vLLM for high-throughput offline inference.
+OPTIMIZED VERSION: Uses vLLM engine, Tensor Parallelism, and Continuous Batching.
 
 Output Format:
 Query 	 SemID||SongID||SongName||Singer 	 SemID||SongID||SongName||Singer ...
@@ -9,250 +9,234 @@ import os
 import sys
 import argparse
 import logging
-import random
 import torch
-import math
-import time
+import json
+import re
+from typing import List, Dict, Tuple
+from collections import defaultdict
 from tqdm import tqdm
-from torch import multiprocessing as mp
 
-# Add project root to sys.path
+# Add project root to sys.path for config and utils
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from config import Config
-from src.generator.inference_t5 import PlaylistGenerator
 from src.common.utils import setup_logging
 
-# Set start method to spawn to ensure CUDA compatibility in multiprocessing
 try:
-    mp.set_start_method('spawn', force=True)
-except RuntimeError:
-    pass
+    from vllm import LLM, SamplingParams
+except ImportError:
+    print("Error: vLLM is not installed. Please run `pip install vllm`.")
+    sys.exit(1)
 
 logger = logging.getLogger(__name__)
 
-def clean_text(text: str) -> str:
-    """
-    Clean text to ensure file integrity.
-    1. Removes newlines/tabs to maintain one-line-per-query structure.
-    2. Removes the internal separator (||) to prevent parsing errors.
-    """
-    if not text:
-        return "Unknown"
-    text = str(text)
-    # Replace structural characters with spaces
-    text = text.replace("\n", " ").replace("\r", " ").replace("\t", " ")
-    # Remove our custom delimiter if it appears in text
-    text = text.replace("||", " ")
-    return text.strip()
+class PredictionFormatter:
+    """Helper class to format vLLM outputs back to song information."""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.semantic_to_song_cluster = self._create_reverse_map()
+        self.song_info_map = self._load_song_info()
+        
+    def _create_reverse_map(self) -> Dict[Tuple[int, ...], List[str]]:
+        """Load semantic ID -> song IDs mapping."""
+        mapping = defaultdict(list)
+        semantic_ids_file = self.config.data.semantic_ids_file
+        
+        logger.info(f"Loading semantic ID map from {semantic_ids_file}...")
+        if not os.path.exists(semantic_ids_file):
+            logger.error(f"Semantic ID file not found: {semantic_ids_file}")
+            return mapping
 
-def run_inference_worker(rank, gpu_id, queries, args, output_file):
-    """
-    Worker function for multi-GPU inference.
-    Each worker runs on a dedicated GPU and processes a subset of queries.
-    """
-    # 1. Setup environment for this process
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    
-    # 2. Setup independent logging
-    log_file = f"logs/gen_worker_{rank}.log"
-    os.makedirs("logs", exist_ok=True)
-    worker_logger = logging.getLogger(f"worker_{rank}")
-    worker_logger.setLevel(logging.INFO)
-    # Clear existing handlers to avoid duplicate logs if re-initialized
-    if worker_logger.hasHandlers():
-        worker_logger.handlers.clear()
-    handler = logging.FileHandler(log_file)
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    handler.setFormatter(formatter)
-    worker_logger.addHandler(handler)
-    
-    worker_logger.info(f"Worker {rank} started on GPU {gpu_id} (Physical ID) with {len(queries)} queries.")
-    
-    # 3. Set seeds for reproducibility
-    random.seed(args.seed + rank)
-    torch.manual_seed(args.seed + rank)
-    
-    # 4. Initialize Config and Generator
-    config = Config()
-    config.device = "cuda" 
-    
-    try:
-        worker_logger.info("Initializing Generator model...")
-        # Ensure model is loaded in eval mode
-        generator = PlaylistGenerator(config, model_path=args.model_path, use_trie_constraint=True)
-    except Exception as e:
-        worker_logger.error(f"Failed to initialize generator: {e}")
-        return
+        with open(semantic_ids_file, 'r', encoding='utf-8') as f:
+            for line in tqdm(f, desc="Loading ID Map"):
+                try:
+                    item = json.loads(line)
+                    # Assuming item['semantic_ids'] is a list like [1, 2, 3]
+                    mapping[tuple(item['semantic_ids'])].append(item['song_id'])
+                except json.JSONDecodeError:
+                    continue
+        return mapping
 
-    # 5. Inference Loop
-    batch_size = args.batch_size
-    worker_logger.info(f"Starting inference with batch_size={batch_size}")
-    
-    with open(output_file, 'w', encoding='utf-8') as out_f:
-        for i in tqdm(range(0, len(queries), batch_size), desc=f"GPU {gpu_id}", position=rank):
-            batch_queries = queries[i : i + batch_size]
-            try:
-                do_sample = (args.strategy == "sample")
-                
-                # Batch Generation
-                batch_results = generator.generate_batch(
-                    batch_queries, 
-                    max_songs=50, 
-                    do_sample=do_sample, 
-                    num_beams=args.num_beams,
-                    temperature=args.temperature,
-                    top_k=args.top_k,
-                    top_p=args.top_p
-                )
-                
-                # Process and Write Results
-                for query, results in zip(batch_queries, batch_results):
-                    output_parts = []
-                    # Using a set to avoid duplicate songs for the same query if expanded from different sem_ids
-                    seen_songs = set()
+    def _load_song_info(self) -> Dict[str, Dict[str, str]]:
+        """Load song metadata."""
+        import csv
+        mapping = {}
+        path = getattr(self.config.data, 'song_info_file', 'data/gen_song_info.csv')
+        
+        logger.info(f"Loading song info from {path}...")
+        try:
+            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                reader = csv.reader(f, delimiter='\t')
+                for row in reader:
+                    if len(row) >= 3:
+                        mapping[row[0]] = {"name": row[1], "singer": row[2]}
+        except FileNotFoundError:
+            logger.warning(f"Song info file not found: {path}")
+        return mapping
 
-                    for item in results:
-                        semantic_id_tuple = item['semantic_id']
-                        
-                        # Expand semantic ID cluster to all songs
-                        if semantic_id_tuple in generator.semantic_to_song_cluster:
-                            song_ids = generator.semantic_to_song_cluster[semantic_id_tuple]
-                            
-                            for song_id in song_ids:
-                                if song_id in seen_songs:
-                                    continue
-                                seen_songs.add(song_id)
+    def clean_text(self, text: str) -> str:
+        if not text: return "Unknown"
+        return str(text).replace("\n", " ").replace("\r", " ").replace("\t", " ").replace("||", " ").strip()
 
-                                song_info = generator.song_info_map.get(song_id, {"name": "Unknown", "singer": "Unknown"})
-                                song_name = clean_text(song_info.get("name", "Unknown"))
-                                singer = clean_text(song_info.get("singer", "Unknown"))
-                                
-                                # Format: SemID||SongID||SongName||Singer
-                                sem_id_str = str(semantic_id_tuple) # e.g., "(1, 2, 3)"
-                                entry_str = f"{sem_id_str}||{song_id}||{song_name}||{singer}"
-                                output_parts.append(entry_str)
-                    
-                    # Write line: CleanQuery <TAB> Result1 <TAB> Result2 ...
-                    if output_parts:
-                        clean_query = clean_text(query)
-                        output_line = f"{clean_query}\t" + "\t".join(output_parts) + "\n"
-                        out_f.write(output_line)
-                    
-            except Exception as e:
-                worker_logger.error(f"Error processing batch starting at index {i}: {e}")
+    def parse_output(self, output_text: str) -> List[str]:
+        """
+        Parse raw T5 output string into formatted song entries.
+        Expected format from T5: <id_l1_X> <id_l2_Y> <id_l3_Z> ...
+        """
+        # Simple regex to find the numeric ID in <id_...> tokens
+        # Matches patterns like <id_l1_123>, <id_l2_45>, etc.
+        # Note: vLLM output might contain spaces between tokens.
+        
+        # Strategy: Extract all numbers that are part of an <id_...> token
+        # Pattern: <id_l[1-3]_(\d+)> 
+        
+        # Pattern: <id_l[1-3]_(\d+)> 
+        matches = re.findall(r"<id_l[1-3]_(\d+)>", output_text)
+        
+        if not matches:
+            return []
+            
+        ids = [int(m) for m in matches]
+        
+        # Group into triplets (L1, L2, L3)
+        # Assuming 3 levels hierarchy
+        levels = 3
+        formatted_entries = []
+        seen_songs = set()
+        
+        for i in range(0, len(ids), levels):
+            chunk = ids[i : i + levels]
+            if len(chunk) != levels:
                 continue
                 
-    worker_logger.info(f"Worker {rank} finished successfully.")
-
+            sem_id_tuple = tuple(chunk)
+            
+            # Expand to songs
+            if sem_id_tuple in self.semantic_to_song_cluster:
+                song_ids = self.semantic_to_song_cluster[sem_id_tuple]
+                
+                for song_id in song_ids:
+                    if song_id in seen_songs:
+                        continue
+                    seen_songs.add(song_id)
+                    
+                    info = self.song_info_map.get(song_id, {"name": "Unknown", "singer": "Unknown"})
+                    s_name = self.clean_text(info.get("name", "Unknown"))
+                    s_singer = self.clean_text(info.get("singer", "Unknown"))
+                    
+                    # Format: SemID||SongID||SongName||Singer
+                    entry = f"{sem_id_tuple}||{song_id}||{s_name}||{s_singer}"
+                    formatted_entries.append(entry)
+                    
+        return formatted_entries
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate predictions (Multi-GPU Optimized)")
+    parser = argparse.ArgumentParser(description="vLLM Inference for Playlist Generation")
     parser.add_argument("--input_file", type=str, default="data/query_tag_map_top_mixsongid_rain_2025-11-17.txt")
-    parser.add_argument("--output_file", type=str, default="outputs/offline_dict_optimized.txt")
+    parser.add_argument("--output_file", type=str, default="outputs/predictions_vllm.txt")
     parser.add_argument("--model_path", type=str, default="models/generator/final_model/")
-    
-    # Data args
-    parser.add_argument("--sample_size", type=int, default=None, help="Sample N queries (None=all)")
-    
-    # Inference args
-    parser.add_argument("--strategy", type=str, default="sample", choices=["beam", "sample"])
-    parser.add_argument("--num_beams", type=int, default=1)
-    parser.add_argument("--temperature", type=float, default=0.8)
-    parser.add_argument("--top_k", type=int, default=50)
-    parser.add_argument("--top_p", type=float, default=0.9)
+    parser.add_argument("--tensor_parallel_size", type=int, default=2, help="Number of GPUs to use")
+    parser.add_argument("--sample_size", type=int, default=None, help="Debug: sample N queries")
     parser.add_argument("--seed", type=int, default=42)
     
-    # Parallelism args
-    parser.add_argument("--num_gpus", type=int, default=2, help="Number of GPUs to use")
-    parser.add_argument("--batch_size", type=int, default=64, help="Batch size per GPU")
-    
+    # Decoding args
+    parser.add_argument("--temperature", type=float, default=0.8)
+    parser.add_argument("--top_p", type=float, default=0.9)
+    parser.add_argument("--max_tokens", type=int, default=128)
+    parser.add_argument("--num_return_sequences", type=int, default=5, help="Number of sequences per query")
+
     args = parser.parse_args()
     
-    setup_logging(log_file="logs/generate_predictions_main.log")
-    logger.info("--- Starting Optimized Multi-GPU Inference ---")
-    
-    # 1. Load and Preprocess Queries
+    setup_logging(log_file="logs/generate_predictions_vllm.log")
+    logger.info("--- Starting vLLM Inference ---")
+
+    # 1. Load Queries
     logger.info(f"Loading queries from {args.input_file}...")
-    if not os.path.exists(args.input_file):
-        logger.error(f"Input file not found: {args.input_file}")
+    queries = []
+    if os.path.exists(args.input_file):
+        with open(args.input_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line: continue
+                parts = line.split('\t')
+                if len(parts) >= 1:
+                    queries.append(parts[0])
+    else:
+        logger.error("Input file not found.")
         sys.exit(1)
         
-    queries = []
-    with open(args.input_file, 'r', encoding='utf-8') as f:
-        for line in f:
-            line = line.strip()
-            if not line: continue
-            parts = line.split('\t')
-            if len(parts) >= 1:
-                queries.append(parts[0])
-                
     # Deduplicate
-    original_len = len(queries)
     queries = list(dict.fromkeys(queries))
-    logger.info(f"Loaded {len(queries)} unique queries (deduplicated from {original_len}).")
+    logger.info(f"Loaded {len(queries)} unique queries.")
     
-    if args.sample_size and args.sample_size < len(queries):
+    if args.sample_size:
+        import random
         random.seed(args.seed)
         queries = random.sample(queries, args.sample_size)
-        logger.info(f"Sampled {len(queries)} queries.")
+        logger.info(f"Sampled {len(queries)} queries for debugging.")
 
-    # 2. Distribute Workload
-    available_gpus = torch.cuda.device_count()
-    num_workers = min(args.num_gpus, available_gpus)
-    
-    if num_workers < 1:
-        logger.warning("No GPU detected. Running in single-process CPU mode (very slow).")
-        run_inference_worker(0, -1, queries, args, args.output_file)
-        return
+    # 2. Initialize Helper (Formatter)
+    # Do this before loading vLLM to fail fast if data missing
+    config = Config()
+    formatter = PredictionFormatter(config)
 
-    logger.info(f"Launching {num_workers} worker processes on {num_workers} GPUs.")
-    
-    chunk_size = math.ceil(len(queries) / num_workers)
-    processes = []
-    temp_files = []
-    
-    for i in range(num_workers):
-        start_idx = i * chunk_size
-        end_idx = min((i + 1) * chunk_size, len(queries))
-        worker_queries = queries[start_idx:end_idx]
-        
-        if not worker_queries:
-            continue
-            
-        part_file = f"{args.output_file}.part{i}"
-        temp_files.append(part_file)
-        
-        p = mp.Process(
-            target=run_inference_worker,
-            args=(i, i, worker_queries, args, part_file)
+    # 3. Initialize vLLM Engine
+    logger.info(f"Initializing vLLM Engine on {args.tensor_parallel_size} GPUs...")
+    try:
+        # vLLM handles distributed initialization internally
+        llm = LLM(
+            model=args.model_path,
+            tensor_parallel_size=args.tensor_parallel_size,
+            dtype="bfloat16", # Optimization for L20
+            trust_remote_code=True
         )
-        p.start()
-        processes.append(p)
-    
-    # 3. Wait for Completion
-    for p in processes:
-        p.join()
-        if p.exitcode != 0:
-            logger.error(f"Process {p.pid} failed with exit code {p.exitcode}.")
-            sys.exit(1)
-            
-    # 4. Merge Results
-    logger.info("All workers finished. Merging results...")
-    with open(args.output_file, 'w', encoding='utf-8') as final_out:
-        for temp_file in temp_files:
-            if os.path.exists(temp_file):
-                with open(temp_file, 'r', encoding='utf-8') as f:
-                    import shutil
-                    shutil.copyfileobj(f, final_out)
-                os.remove(temp_file)
-            else:
-                logger.warning(f"Temporary file {temp_file} missing.")
+    except Exception as e:
+        logger.error(f"Failed to initialize vLLM: {e}")
+        sys.exit(1)
 
-    logger.info(f"Successfully generated predictions for {len(queries)} queries.")
-    logger.info(f"Output saved to: {args.output_file}")
+    # 4. Define Sampling Params
+    # Setting seed here ensures reproducibility for EACH request
+    sampling_params = SamplingParams(
+        temperature=args.temperature,
+        top_p=args.top_p,
+        max_tokens=args.max_tokens,
+        n=args.num_return_sequences, # Generate N candidates per query
+        seed=args.seed 
+    )
+
+    # 5. Run Inference
+    logger.info("Running inference (vLLM handles batching)...")
+    # Pass the list of strings directly. vLLM manages the queue.
+    outputs = llm.generate(queries, sampling_params)
+
+    # 6. Process and Save Results
+    logger.info("Processing results...")
+    
+    os.makedirs(os.path.dirname(args.output_file), exist_ok=True)
+    
+    with open(args.output_file, 'w', encoding='utf-8') as f:
+        for output in tqdm(outputs, desc="Formatting"):
+            query = formatter.clean_text(output.prompt)
+            
+            # Aggregate all generated sequences for this query
+            all_entries = []
+            for generated_seq in output.outputs:
+                # parse_output returns a list of formatted song strings
+                entries = formatter.parse_output(generated_seq.text)
+                all_entries.extend(entries)
+            
+            # Deduplicate entries (same song might be generated in different beams/samples)
+            # Order is preserved by dict keys
+            unique_entries = list(dict.fromkeys(all_entries))
+            
+            if unique_entries:
+                line = f"{query}\t" + "\t".join(unique_entries) + "\n"
+                f.write(line)
+
+    logger.info(f"Done. Results saved to {args.output_file}")
 
 if __name__ == "__main__":
     main()
