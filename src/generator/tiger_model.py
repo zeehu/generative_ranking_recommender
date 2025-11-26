@@ -286,7 +286,7 @@ class TIGERModel(nn.Module):
             json.dump(config_dict, f)
     
     @classmethod
-    def from_pretrained(cls, load_directory: str):
+    def from_pretrained(cls, load_directory: str, **kwargs):
         """Load model and tokenizer"""
         # Load config
         config_path = os.path.join(load_directory, 'tiger_config.json')
@@ -303,7 +303,7 @@ class TIGERModel(nn.Module):
         tokenizer = TIGERTokenizer.from_pretrained(load_directory)
         
         # Load the T5 model directly from the saved directory
-        t5_model = T5ForConditionalGeneration.from_pretrained(load_directory)
+        t5_model = T5ForConditionalGeneration.from_pretrained(load_directory, **kwargs)
         
         # Verify vocab size matches
         if t5_model.config.vocab_size != len(tokenizer):

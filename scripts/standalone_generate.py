@@ -129,9 +129,9 @@ class StandaloneGenerator:
                 tuples.append(tuple(chunk))
         return tuples
 
-    def generate_batch(self, queries: List[str], **gen_kwargs) -> List[List[str]]:
+    def generate_batch(self, queries: List[str], **gen_kwargs) -> Tuple[List[List[str]], List[List[str]]]:
         """
-        Run batch generation and return formatted result strings.
+        Run batch generation and return formatted result strings AND raw texts.
         """
         # Tokenize
         inputs = self.tokenizer(
@@ -155,39 +155,83 @@ class StandaloneGenerator:
         
         num_return = gen_kwargs.get("num_return_sequences", 1)
         formatted_results = [] # List[List[str]]
+        raw_text_results = [] # List[List[str]]
         
         decoded_texts = self.tokenizer.batch_decode(outputs, skip_special_tokens=False)
         
         for i in range(len(queries)):
             query_results = []
-            seen_songs = set()
+            query_raw_texts = []
             
+            # Track stats for ranking
+            # Key: song_id (for valid songs) or "phantom_{tuple}" (for invalid)
+            hit_counts = defaultdict(int)
+            hit_meta = {} # Store metadata to avoid re-fetching
+
             # Get the slice of generations for this query
             start = i * num_return
             end = start + num_return
             texts = decoded_texts[start:end]
             
             for text in texts:
+                query_raw_texts.append(text) # Store raw text
                 sem_tuples = self.parse_ids(text)
+                
+                # Deduplicate votes within a single generated sequence
+                # We want to reward songs that appear in *multiple* generations (high confidence),
+                # not songs that are just repeated in one glitchy generation.
+                seen_in_seq = set()
+
                 for sem_tuple in sem_tuples:
                     # Expand to songs
                     song_ids = self.sem_id_to_songs.get(sem_tuple, [])
-                    for song_id in song_ids:
-                        if song_id in seen_songs: continue
-                        seen_songs.add(song_id)
+                    
+                    if song_ids:
+                        for song_id in song_ids:
+                            key = song_id
+                            if key in seen_in_seq: continue
+                            seen_in_seq.add(key)
+                            
+                            hit_counts[key] += 1
+                            
+                            if key not in hit_meta:
+                                meta = self.song_info.get(song_id, {"name": "Unknown", "singer": "Unknown"})
+                                hit_meta[key] = {
+                                    "sem_tuple": sem_tuple,
+                                    "song_id": song_id,
+                                    "name": clean_text(meta["name"]),
+                                    "singer": clean_text(meta["singer"])
+                                }
+                    else:
+                        # No mapping found (Phantom)
+                        key = f"phantom_{sem_tuple}"
+                        if key in seen_in_seq: continue
+                        seen_in_seq.add(key)
                         
-                        # Get Metadata
-                        meta = self.song_info.get(song_id, {"name": "Unknown", "singer": "Unknown"})
-                        s_name = clean_text(meta["name"])
-                        s_singer = clean_text(meta["singer"])
+                        hit_counts[key] += 1
                         
-                        # Format: SemID||SongID||SongName||Singer
-                        entry = f"{sem_tuple}||{song_id}||{s_name}||{s_singer}"
-                        query_results.append(entry)
+                        if key not in hit_meta:
+                            hit_meta[key] = {
+                                "sem_tuple": sem_tuple,
+                                "song_id": "",
+                                "name": "",
+                                "singer": ""
+                            }
+            
+            # Sort results by frequency (descending)
+            sorted_keys = sorted(hit_counts.keys(), key=lambda k: hit_counts[k], reverse=True)
+            
+            for k in sorted_keys:
+                meta = hit_meta[k]
+                count = hit_counts[k]
+                # Format: SemID||SongID||SongName||Singer||Frequency
+                entry = f"{meta['sem_tuple']}||{meta['song_id']}||{meta['name']}||{meta['singer']}||{count}"
+                query_results.append(entry)
             
             formatted_results.append(query_results)
+            raw_text_results.append(query_raw_texts)
             
-        return formatted_results
+        return formatted_results, raw_text_results
 
 def worker_process(rank, gpu_id, queries, args, output_file):
     """Worker process logic."""
@@ -230,12 +274,17 @@ def worker_process(rank, gpu_id, queries, args, output_file):
         for i in tqdm(range(0, len(queries), batch_size), desc=f"GPU {gpu_id}", position=rank):
             batch_q = queries[i : i + batch_size]
             try:
-                results = generator.generate_batch(batch_q, **gen_kwargs)
+                results, raw_texts = generator.generate_batch(batch_q, **gen_kwargs)
                 
-                for q, res_list in zip(batch_q, results):
+                for q, res_list, raw_list in zip(batch_q, results, raw_texts):
+                    clean_q = clean_text(q)
                     if res_list:
-                        clean_q = clean_text(q)
                         line = f"{clean_q}\t" + "\t".join(res_list) + "\n"
+                        f.write(line)
+                    else:
+                        # Write raw text for debugging if no valid results
+                        raw_str = " || ".join([clean_text(r) for r in raw_list])
+                        line = f"{clean_q}\tEMPTY_RAW:{raw_str}\n"
                         f.write(line)
             except Exception as e:
                 logger.error(f"Batch error: {e}")
@@ -262,6 +311,13 @@ def main():
     parser.add_argument("--sample_size", type=int, default=None)
 
     args = parser.parse_args()
+    
+    # Validate/Adjust arguments for Beam Search
+    if args.strategy == "beam":
+        if args.num_beams < args.num_return_sequences:
+            logger.warning(f"Beam search requires num_beams >= num_return_sequences. "
+                           f"Adjusting num_beams from {args.num_beams} to {args.num_return_sequences}.")
+            args.num_beams = max(args.num_beams, args.num_return_sequences)
     
     setup_logging(log_file="logs/generate_main.log")
     logger.info("--- Starting Standalone Multi-GPU Inference ---")
