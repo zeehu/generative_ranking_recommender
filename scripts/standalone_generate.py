@@ -27,7 +27,7 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-from config import Config
+from config_optimized import Config
 from src.generator.tiger_model import TIGERModel
 from src.common.utils import setup_logging
 
@@ -298,11 +298,11 @@ def main():
     parser.add_argument("--output_file", type=str, default="outputs/predictions_standalone.txt")
     parser.add_argument("--model_path", type=str, default="models/generator/final_model/")
     parser.add_argument("--num_gpus", type=int, default=2)
-    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--batch_size", type=int, default=256)
     
     # Decoding
     parser.add_argument("--strategy", type=str, default="sample", choices=["sample", "beam"])
-    parser.add_argument("--num_beams", type=int, default=1)
+    parser.add_argument("--num_beams", type=int, default=5)
     parser.add_argument("--num_return_sequences", type=int, default=5)
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top_k", type=int, default=50)
