@@ -130,136 +130,137 @@ def main():
     # 1. Load Voting Data
     voting_map = load_voting_results(args.vote_file)
 
-        # 2. Process Predictions
-        logger.info(f"Processing predictions from {args.pred_file}...")
-        
-        # Get total lines for tqdm
-        total_lines = sum(1 for _ in open(args.pred_file, 'r', encoding='utf-8'))
-        
-        # Buckets
-        singer_hallucinations = [] # (Query, Line)
-        
-        match_l3_gen = []
-        match_l3_vote = []
-        
-        match_l2_gen = []
-        match_l2_vote = []
-        
-        match_l1_gen = []
-        match_l1_vote = []
-        
-        mismatch_gen = []
-        mismatch_vote = []
-        
-        remainder_gen = []
-        
-        processed_count = 0
-        total_gen_songs = 0 # For stats
-        
-        from tqdm import tqdm
-        
-        with open(args.pred_file, 'r', encoding='utf-8') as f:
-            for line in tqdm(f, total=total_lines, desc="Evaluating", unit="q"):
-                processed_count += 1
-                clean_line = line.strip()
-                query, parsed_results = parse_prediction_line(clean_line)
-                
-                if not query:
-                    continue
-                
-                # Stats: Count generated songs
-                total_gen_songs += len(parsed_results)
+    # 2. Process Predictions
+    logger.info(f"Processing predictions from {args.pred_file}...")
     
-                # --- Check 1: Singer Hallucination / Bias ---
-                # Logic: All generated songs have the same singer, AND singer name not in query.
-                # Only consider cases where we have at least some valid song info (not empty phantom entries)
-                valid_singers = set()
-                has_valid_song = False
-                
-                for res in parsed_results:
-                    s = res['singer']
-                    if s and s != "Unknown":
-                        valid_singers.add(s)
-                        has_valid_song = True
-                
-                is_hallucination = False
-                if has_valid_song and len(valid_singers) == 1:
-                    unique_singer = list(valid_singers)[0]
-                    # Case-insensitive check
-                    if unique_singer.lower() not in query.lower():
-                        singer_hallucinations.append(clean_line)
-                        is_hallucination = True
-                
-                # Note: We continue to categorize even if it is a hallucination, 
-                # or you can choose to `continue` here if you want them exclusive.
-                # Assuming we want to categorize everything by ID match primarily.
+    # Get total lines for tqdm
+    total_lines = sum(1 for _ in open(args.pred_file, 'r', encoding='utf-8'))
     
-                # --- Check 2: Semantic ID Matching ---
-                if query in voting_map:
-                    vote_id = voting_map[query]
-                    vote_str_formatted = f"{query}\t{vote_id}"
-                    
-                    best_match_level = 0 # 0: Mismatch, 1: L1, 2: L2, 3: L3
-                    
-                    if parsed_results:
-                        # Iterate through ALL generated results, not just Top-1
-                        for res in parsed_results:
-                            gen_id = res['sem_id']
-                            
-                            current_level = 0
-                            if gen_id == vote_id:
-                                current_level = 3
-                            elif gen_id[:2] == vote_id[:2]:
-                                current_level = 2
-                            elif gen_id[:1] == vote_id[:1]:
-                                current_level = 1
-                            
-                            # Keep the best match found so far
-                            if current_level > best_match_level:
-                                best_match_level = current_level
-                                # Optimization: If L3 match found, we can stop looking
-                                if best_match_level == 3:
-                                    break
-                    
-                    # Assign to bucket based on BEST match found across all candidates
-                    if best_match_level == 3:
-                        match_l3_gen.append(clean_line)
-                        match_l3_vote.append(vote_str_formatted)
-                    elif best_match_level == 2:
-                        match_l2_gen.append(clean_line)
-                        match_l2_vote.append(vote_str_formatted)
-                    elif best_match_level == 1:
-                        match_l1_gen.append(clean_line)
-                        match_l1_vote.append(vote_str_formatted)
-                    else:
-                        mismatch_gen.append(clean_line)
-                        mismatch_vote.append(vote_str_formatted)
+    # Buckets
+    singer_hallucinations = [] # (Query, Line)
+    
+    match_l3_gen = []
+    match_l3_vote = []
+    
+    match_l2_gen = []
+    match_l2_vote = []
+    
+    match_l1_gen = []
+    match_l1_vote = []
+    
+    mismatch_gen = []
+    mismatch_vote = []
+    
+    remainder_gen = []
+    
+    processed_count = 0
+    total_gen_songs = 0 # For stats
+    
+    from tqdm import tqdm
+    
+    with open(args.pred_file, 'r', encoding='utf-8') as f:
+        for line in tqdm(f, total=total_lines, desc="Evaluating", unit="q"):
+            processed_count += 1
+            clean_line = line.strip()
+            query, parsed_results = parse_prediction_line(clean_line)
+            
+            if not query:
+                continue
+            
+            # Stats: Count generated songs
+            total_gen_songs += len(parsed_results)
+
+            # --- Check 1: Singer Hallucination / Bias ---
+            # Logic: All generated songs have the same singer, AND singer name not in query.
+            # Only consider cases where we have at least some valid song info (not empty phantom entries)
+            valid_singers = set()
+            has_valid_song = False
+            
+            for res in parsed_results:
+                s = res['singer']
+                if s and s != "Unknown":
+                    valid_singers.add(s)
+                    has_valid_song = True
+            
+            is_hallucination = False
+            if has_valid_song and len(valid_singers) == 1:
+                unique_singer = list(valid_singers)[0]
+                # Case-insensitive check
+                if unique_singer.lower() not in query.lower():
+                    singer_hallucinations.append(clean_line)
+                    is_hallucination = True
+            
+            # Note: We continue to categorize even if it is a hallucination, 
+            # or you can choose to `continue` here if you want them exclusive.
+            # Assuming we want to categorize everything by ID match primarily.
+
+            # --- Check 2: Semantic ID Matching ---
+            if query in voting_map:
+                vote_id = voting_map[query]
+                vote_str_formatted = f"{query}\t{vote_id}"
+                
+                best_match_level = 0 # 0: Mismatch, 1: L1, 2: L2, 3: L3
+                
+                if parsed_results:
+                    # Iterate through ALL generated results, not just Top-1
+                    for res in parsed_results:
+                        gen_id = res['sem_id']
+                        
+                        current_level = 0
+                        if gen_id == vote_id:
+                            current_level = 3
+                        elif gen_id[:2] == vote_id[:2]:
+                            current_level = 2
+                        elif gen_id[:1] == vote_id[:1]:
+                            current_level = 1
+                        
+                        # Keep the best match found so far
+                        if current_level > best_match_level:
+                            best_match_level = current_level
+                            # Optimization: If L3 match found, we can stop looking
+                            if best_match_level == 3:
+                                break
+                
+                # Assign to bucket based on BEST match found across all candidates
+                if best_match_level == 3:
+                    match_l3_gen.append(clean_line)
+                    match_l3_vote.append(vote_str_formatted)
+                elif best_match_level == 2:
+                    match_l2_gen.append(clean_line)
+                    match_l2_vote.append(vote_str_formatted)
+                elif best_match_level == 1:
+                    match_l1_gen.append(clean_line)
+                    match_l1_vote.append(vote_str_formatted)
                 else:
-                    # No voting data for this query
-                    remainder_gen.append(clean_line)
+                    mismatch_gen.append(clean_line)
+                    mismatch_vote.append(vote_str_formatted)
+            else:
+                # No voting data for this query
+                remainder_gen.append(clean_line)
+
+    # 3. Print Statistics
+    avg_songs = total_gen_songs / processed_count if processed_count > 0 else 0
+    total_with_votes = len(match_l3_gen) + len(match_l2_gen) + len(match_l1_gen) + len(mismatch_gen)
     
-        # 3. Print Statistics
-        avg_songs = total_gen_songs / processed_count if processed_count > 0 else 0
-        total_with_votes = len(match_l3_gen) + len(match_l2_gen) + len(match_l1_gen) + len(mismatch_gen)
-        
-        logger.info("="*60)
-        logger.info("EVALUATION STATISTICS")
-        logger.info("="*60)
-        logger.info(f"Total Queries Processed:   {processed_count}")
-        logger.info(f"Avg Generated Songs/Query: {avg_songs:.2f}")
-        logger.info(f"Singer Hallucination Bias: {len(singer_hallucinations)} ({len(singer_hallucinations)/processed_count*100:.1f}%)")
-        logger.info("-" * 60)
-        logger.info(f"Queries with Voting Data:  {total_with_votes}")
-        if total_with_votes > 0:
-            logger.info(f"  L3 Match (Perfect):      {len(match_l3_gen):<5} ({len(match_l3_gen)/total_with_votes*100:.1f}%)")
-            logger.info(f"  L2 Match (2 layers):     {len(match_l2_gen):<5} ({len(match_l2_gen)/total_with_votes*100:.1f}%)")
-            logger.info(f"  L1 Match (1 layer):      {len(match_l1_gen):<5} ({len(match_l1_gen)/total_with_votes*100:.1f}%)")
-            logger.info(f"  Mismatch:                {len(mismatch_gen):<5} ({len(mismatch_gen)/total_with_votes*100:.1f}%)")
-        logger.info("-" * 60)
-        logger.info(f"Remainder (No Voting Data): {len(remainder_gen)}")
-        logger.info("="*60)
-    
-        # 4. Save Results    logger.info(f"Processed {processed_count} queries.")
+    logger.info("="*60)
+    logger.info("EVALUATION STATISTICS")
+    logger.info("="*60)
+    logger.info(f"Total Queries Processed:   {processed_count}")
+    logger.info(f"Avg Generated Songs/Query: {avg_songs:.2f}")
+    logger.info(f"Singer Hallucination Bias: {len(singer_hallucinations)} ({len(singer_hallucinations)/processed_count*100:.1f}%)")
+    logger.info("-" * 60)
+    logger.info(f"Queries with Voting Data:  {total_with_votes}")
+    if total_with_votes > 0:
+        logger.info(f"  L3 Match (Perfect):      {len(match_l3_gen):<5} ({len(match_l3_gen)/total_with_votes*100:.1f}%)")
+        logger.info(f"  L2 Match (2 layers):     {len(match_l2_gen):<5} ({len(match_l2_gen)/total_with_votes*100:.1f}%)")
+        logger.info(f"  L1 Match (1 layer):      {len(match_l1_gen):<5} ({len(match_l1_gen)/total_with_votes*100:.1f}%)")
+        logger.info(f"  Mismatch:                {len(mismatch_gen):<5} ({len(mismatch_gen)/total_with_votes*100:.1f}%)")
+    logger.info("-" * 60)
+    logger.info(f"Remainder (No Voting Data): {len(remainder_gen)}")
+    logger.info("="*60)
+
+    # 4. Save Results
+    logger.info(f"Processed {processed_count} queries.")
     logger.info("Saving results...")
 
     def save_pair(name, gen_data, vote_data=None):
