@@ -69,7 +69,7 @@ class StandaloneGenerator:
         logger.info(f"Using dtype: {dtype}")
         
         try:
-            self.model = TIGERModel.from_pretrained(model_path, torch_dtype=dtype).to(self.device)
+            self.model = TIGERModel.from_pretrained(model_path, dtype=dtype).to(self.device)
             self.model.eval()
             
             # Compile for speedup (PyTorch 2.0+)
