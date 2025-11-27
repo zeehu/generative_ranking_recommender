@@ -16,6 +16,8 @@ import ast
 from collections import defaultdict
 from typing import List, Dict, Tuple, Set
 
+import json
+
 # Setup logging
 logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -26,6 +28,28 @@ logger = logging.getLogger(__name__)
 def ensure_dir(path):
     if not os.path.exists(path):
         os.makedirs(path)
+
+def load_semantic_map(file_path: str) -> Dict[str, Tuple[int, ...]]:
+    """
+    Loads song_id -> semantic_ids mapping from JSONL file.
+    """
+    logger.info(f"Loading semantic map from {file_path}...")
+    sem_map = {}
+    if not os.path.exists(file_path):
+        logger.error(f"Semantic map file not found: {file_path}")
+        sys.exit(1)
+        
+    with open(file_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            try:
+                data = json.loads(line)
+                song_id = str(data['song_id'])
+                sem_ids = tuple(data['semantic_ids'])
+                sem_map[song_id] = sem_ids
+            except:
+                continue
+    logger.info(f"Loaded {len(sem_map)} song semantic mappings.")
+    return sem_map
 
 def parse_prediction_line(line: str) -> Tuple[str, List[dict]]:
     """
@@ -72,10 +96,10 @@ def parse_prediction_line(line: str) -> Tuple[str, List[dict]]:
             
     return query, results
 
-def load_voting_results(file_path: str) -> Dict[str, Tuple[int, ...]]:
+def load_voting_results(file_path: str, sem_map: Dict[str, Tuple[int, ...]]) -> Dict[str, Tuple[int, ...]]:
     """
-    Loads voting results. Assumes format contains Query and a Semantic ID Tuple.
-    Simple parser: Looks for the first occurrence of a tuple string in the line.
+    Loads voting results with format: query \t song_id:vote,song_id:vote...
+    Maps the highest-voted song to its semantic ID.
     """
     logger.info(f"Loading voting results from {file_path}...")
     voting_data = {}
@@ -84,33 +108,43 @@ def load_voting_results(file_path: str) -> Dict[str, Tuple[int, ...]]:
         logger.warning(f"Voting file not found: {file_path}")
         return voting_data
 
+    valid_queries = 0
     with open(file_path, 'r', encoding='utf-8') as f:
         for line in f:
             line = line.strip()
             if not line: continue
             
             parts = line.split('\t')
+            if len(parts) < 2: continue
+            
             query = parts[0]
+            vote_str = parts[1] # "song1:5,song2:3"
             
-            # Try to find a tuple in the line
-            found_tuple = False
-            for part in parts[1:]:
-                part = part.strip()
-                if part.startswith('(') and part.endswith(')'):
-                    try:
-                        sem_id = ast.literal_eval(part)
-                        if isinstance(sem_id, tuple) and len(sem_id) == 3:
-                            voting_data[query] = sem_id
-                            found_tuple = True
-                            break
-                    except:
-                        continue
+            best_sem_id = None
+            max_vote = -1
             
-            if not found_tuple:
-                # Check if maybe the second column is just the tuple string
-                pass 
+            # Parse song:vote pairs
+            pairs = vote_str.split(',')
+            for pair in pairs:
+                if ':' not in pair: continue
+                try:
+                    song_id, vote_count = pair.rsplit(':', 1)
+                    vote_count = int(vote_count)
+                    song_id = song_id.strip()
+                    
+                    # Check if we have a semantic ID for this song
+                    if song_id in sem_map:
+                        if vote_count > max_vote:
+                            max_vote = vote_count
+                            best_sem_id = sem_map[song_id]
+                except:
+                    continue
+            
+            if best_sem_id:
+                voting_data[query] = best_sem_id
+                valid_queries += 1
                 
-    logger.info(f"Loaded {len(voting_data)} valid voting entries.")
+    logger.info(f"Loaded {valid_queries} valid voting entries (mapped to Semantic IDs).")
     return voting_data
 
 def save_lines(filepath, lines):
@@ -122,13 +156,17 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate Generation Results")
     parser.add_argument("--pred_file", type=str, required=True, help="Path to prediction file")
     parser.add_argument("--vote_file", type=str, required=True, help="Path to voting results file")
+    parser.add_argument("--sem_file", type=str, default="outputs/semantic_id/song_semantic_ids.jsonl", help="Path to song semantic IDs JSONL")
     parser.add_argument("--output_dir", type=str, default="outputs/eval_results", help="Directory to save split files")
     
     args = parser.parse_args()
     ensure_dir(args.output_dir)
 
-    # 1. Load Voting Data
-    voting_map = load_voting_results(args.vote_file)
+    # 1. Load Semantic Map
+    sem_map = load_semantic_map(args.sem_file)
+
+    # 2. Load Voting Data
+    voting_map = load_voting_results(args.vote_file, sem_map)
 
     # 2. Process Predictions
     logger.info(f"Processing predictions from {args.pred_file}...")
