@@ -76,7 +76,12 @@ def parse_prediction_line(line: str) -> Tuple[str, List[dict]]:
         # Phantom: (1,2,3)||||||||5 or similar
         if len(fields) >= 1:
             try:
-                sem_id = ast.literal_eval(fields[0])
+                # Fast parsing of tuple string "(1, 2, 3)" -> tuple(1, 2, 3)
+                # Remove parentheses and split
+                sem_str = fields[0].strip().strip("()")
+                if not sem_str:
+                    continue
+                sem_id = tuple(int(x.strip()) for x in sem_str.split(','))
             except:
                 continue # Invalid SemID format
             
@@ -85,6 +90,10 @@ def parse_prediction_line(line: str) -> Tuple[str, List[dict]]:
             singer = fields[3] if len(fields) > 3 else ""
             freq = int(fields[4]) if len(fields) > 4 and fields[4].isdigit() else 1
             
+            # Filter out invalid entries (missing song info)
+            if not song_id or not song_name or not singer:
+                continue
+
             results.append({
                 "sem_id": sem_id,
                 "song_id": song_id,
@@ -96,17 +105,21 @@ def parse_prediction_line(line: str) -> Tuple[str, List[dict]]:
             
     return query, results
 
-def load_voting_results(file_path: str, sem_map: Dict[str, Tuple[int, ...]]) -> Dict[str, Tuple[int, ...]]:
+def load_voting_results(file_path: str, sem_map: Dict[str, Tuple[int, ...]]) -> Tuple[Dict[str, Tuple[int, ...]], Set[Tuple[str, str]]]:
     """
     Loads voting results with format: query \t song_id:vote,song_id:vote...
     Maps the highest-voted song to its semantic ID.
+    Returns:
+        voting_data: Dict[query, best_semantic_id]
+        known_pairs: Set[(query, song_id)] - all pairs that already have votes
     """
     logger.info(f"Loading voting results from {file_path}...")
     voting_data = {}
+    known_pairs = set()
     
     if not os.path.exists(file_path):
         logger.warning(f"Voting file not found: {file_path}")
-        return voting_data
+        return voting_data, known_pairs
 
     valid_queries = 0
     with open(file_path, 'r', encoding='utf-8') as f:
@@ -128,9 +141,12 @@ def load_voting_results(file_path: str, sem_map: Dict[str, Tuple[int, ...]]) -> 
             for pair in pairs:
                 if ':' not in pair: continue
                 try:
+                    # Use rsplit to safely handle song_ids that might rarely contain ':' (though unlikely in this schema)
                     song_id, vote_count = pair.rsplit(':', 1)
                     vote_count = int(vote_count)
                     song_id = song_id.strip()
+                    
+                    known_pairs.add((query, song_id))
                     
                     # Check if we have a semantic ID for this song
                     if song_id in sem_map:
@@ -145,7 +161,7 @@ def load_voting_results(file_path: str, sem_map: Dict[str, Tuple[int, ...]]) -> 
                 valid_queries += 1
                 
     logger.info(f"Loaded {valid_queries} valid voting entries (mapped to Semantic IDs).")
-    return voting_data
+    return voting_data, known_pairs
 
 def save_lines(filepath, lines):
     with open(filepath, 'w', encoding='utf-8') as f:
@@ -158,15 +174,18 @@ def main():
     parser.add_argument("--vote_file", type=str, required=True, help="Path to voting results file")
     parser.add_argument("--sem_file", type=str, default="outputs/semantic_id/song_semantic_ids.jsonl", help="Path to song semantic IDs JSONL")
     parser.add_argument("--output_dir", type=str, default="outputs/eval_results", help="Directory to save split files")
+    parser.add_argument("--auto_vote_file", type=str, default=None, help="Optional: Path to save auto-generated vote file")
     
     args = parser.parse_args()
     ensure_dir(args.output_dir)
+    if args.auto_vote_file:
+        ensure_dir(os.path.dirname(args.auto_vote_file))
 
     # 1. Load Semantic Map
     sem_map = load_semantic_map(args.sem_file)
 
     # 2. Load Voting Data
-    voting_map = load_voting_results(args.vote_file, sem_map)
+    voting_map, known_voted_pairs = load_voting_results(args.vote_file, sem_map)
 
     # 2. Process Predictions
     logger.info(f"Processing predictions from {args.pred_file}...")
@@ -191,6 +210,9 @@ def main():
     
     remainder_gen = []
     
+    # Auto-Vote Buffer
+    auto_vote_lines = []
+    
     processed_count = 0
     total_gen_songs = 0 # For stats
     
@@ -208,58 +230,83 @@ def main():
             # Stats: Count generated songs
             total_gen_songs += len(parsed_results)
 
-            # --- Check 1: Singer Hallucination / Bias ---
-            # Logic: All generated songs have the same singer, AND singer name not in query.
-            # Only consider cases where we have at least some valid song info (not empty phantom entries)
+            # Prepare Voting Target Data (once per query)
+            target_sem_id = voting_map.get(query)
+            target_sem_id_l2 = None
+            target_sem_id_l1 = None
+            
+            if target_sem_id:
+                if len(target_sem_id) >= 2:
+                    target_sem_id_l2 = target_sem_id[:2]
+                if len(target_sem_id) >= 1:
+                    target_sem_id_l1 = target_sem_id[:1]
+
+            # State for this query
+            best_match_level = 0  # 0: Mismatch, 1: L1, 2: L2, 3: L3
             valid_singers = set()
             has_valid_song = False
-            
+
+            # --- Single Pass Loop over Results ---
             for res in parsed_results:
-                s = res['singer']
-                if s and s != "Unknown":
-                    valid_singers.add(s)
+                # Unpack
+                gen_id = res['sem_id']
+                song_id = res['song_id']
+                song_name = res['song_name']
+                singer = res['singer']
+                freq = res['freq']
+
+                # 1. Collect Singer Info (for hallucination check)
+                if singer and singer != "Unknown":
+                    valid_singers.add(singer)
                     has_valid_song = True
-            
-            is_hallucination = False
+
+                # 2. Calculate Match Level (Reused for AutoVote & Evaluation)
+                curr_match_level = 0
+                if target_sem_id and gen_id:
+                    if gen_id == target_sem_id:
+                        curr_match_level = 3
+                    elif target_sem_id_l2 and len(gen_id) >= 2 and gen_id[:2] == target_sem_id_l2:
+                        curr_match_level = 2
+                    elif target_sem_id_l1 and len(gen_id) >= 1 and gen_id[:1] == target_sem_id_l1:
+                        curr_match_level = 1
+                
+                # Update global best match for this query
+                if curr_match_level > best_match_level:
+                    best_match_level = curr_match_level
+
+                # 3. Auto Vote Logic
+                if args.auto_vote_file:
+                    if (query, song_id) not in known_voted_pairs:
+                        vote_val = None
+                        # Logic: best_match_level >= 2
+                        if curr_match_level >= 2:
+                            if freq >= 4: vote_val = 0
+                            elif freq >= 2: vote_val = -1
+                            else: vote_val = -2
+                        else:
+                            # Other data (Match < 2 or No GT)
+                            if freq >= 4: vote_val = 0
+                            elif freq == 3: vote_val = -1
+                            elif freq == 2: vote_val = -2
+                            # freq < 2 -> discard
+                        
+                        if vote_val is not None:
+                            av_line = f"{query}\t{song_id}||{vote_val}||{song_name}||{singer}||{freq}"
+                            auto_vote_lines.append(av_line)
+
+            # --- Post-Loop Analysis ---
+
+            # A. Check Singer Hallucination / Bias
             if has_valid_song and len(valid_singers) == 1:
                 unique_singer = list(valid_singers)[0]
-                # Case-insensitive check
                 if unique_singer.lower() not in query.lower():
                     singer_hallucinations.append(clean_line)
-                    is_hallucination = True
+                    # Note: We don't stop here, we continue to categorize by match level
             
-            # Note: We continue to categorize even if it is a hallucination, 
-            # or you can choose to `continue` here if you want them exclusive.
-            # Assuming we want to categorize everything by ID match primarily.
-
-            # --- Check 2: Semantic ID Matching ---
+            # B. Semantic ID Matching Categorization
             if query in voting_map:
-                vote_id = voting_map[query]
-                vote_str_formatted = f"{query}\t{vote_id}"
+                vote_str_formatted = f"{query}\t{target_sem_id}"
                 
-                best_match_level = 0 # 0: Mismatch, 1: L1, 2: L2, 3: L3
-                
-                if parsed_results:
-                    # Iterate through ALL generated results, not just Top-1
-                    for res in parsed_results:
-                        gen_id = res['sem_id']
-                        
-                        current_level = 0
-                        if gen_id == vote_id:
-                            current_level = 3
-                        elif gen_id[:2] == vote_id[:2]:
-                            current_level = 2
-                        elif gen_id[:1] == vote_id[:1]:
-                            current_level = 1
-                        
-                        # Keep the best match found so far
-                        if current_level > best_match_level:
-                            best_match_level = current_level
-                            # Optimization: If L3 match found, we can stop looking
-                            if best_match_level == 3:
-                                break
-                
-                # Assign to bucket based on BEST match found across all candidates
                 if best_match_level == 3:
                     match_l3_gen.append(clean_line)
                     match_l3_vote.append(vote_str_formatted)
@@ -318,6 +365,10 @@ def main():
     save_pair("match_l1", match_l1_gen, match_l1_vote)
     save_pair("mismatch", mismatch_gen, mismatch_vote)
     save_pair("remainder", remainder_gen) # No voting data for these
+
+    if args.auto_vote_file and auto_vote_lines:
+        logger.info(f"Saving {len(auto_vote_lines)} auto-generated votes to {args.auto_vote_file}...")
+        save_lines(args.auto_vote_file, auto_vote_lines)
 
     logger.info(f"Done! Results saved to {args.output_dir}")
 
